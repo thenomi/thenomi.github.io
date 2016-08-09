@@ -35,3 +35,11 @@ a:hover {
     margin: 5px;
     line-height:1.6em;
     }
+::selection {
+  background: #000; /* WebKit/Blink Browsers */
+  color:#fff;
+}
+::-moz-selection {
+  background: #000
+  color:#fff; /* Gecko Browsers */
+}
