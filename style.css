@@ -1,4 +1,4 @@
-﻿@import 'https://fonts.googleapis.com/css?family=EB+Garamond';
+@import 'https://fonts.googleapis.com/css?family=EB+Garamond';
 body {
   background-color: #fff;
   line-height: 1.6;
@@ -11,6 +11,7 @@ body {
   float:left;
   margin-left:5%;
   margin-top:15px;
+  margin-right:5%;
 }
 a {
   color:#039cfd;
@@ -43,16 +44,27 @@ a:hover {
   background: #000
   color:#fff; /* Gecko Browsers */
 }
-.videoWrapper {
-	position: relative;
-	padding-bottom: 56.25%; /* 16:9 */
-	padding-top: 25px;
-	height: 0;
+
+.intrinsic-container {
+  position: relative;
+  height: 0;
+  overflow: hidden;
 }
-.videoWrapper iframe {
-	position: absolute;
-	top: 0;
-	left: 0;
-	width: 100%;
-	height: 100%;
+ 
+/* 16x9 Aspect Ratio */
+.intrinsic-container-16x9 {
+  padding-bottom: 56.25%;
+}
+ 
+/* 4x3 Aspect Ratio */
+.intrinsic-container-4x3 {
+  padding-bottom: 75%;
+}
+ 
+.intrinsic-container iframe {
+  position: absolute;
+  top:0;
+  left: 0;
+  width: 100%;
+  height: 100%;
 }
