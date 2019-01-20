@@ -1,6 +1,10 @@
 @import url('https://fonts.googleapis.com/css?family=Inconsolata');
 body {
-  background-color: #000;
+  background: #000;
+background: -moz-linear-gradient(left, #000000 0%, #181818 50%,  #303030 100%);
+background: -webkit-linear-gradient(left, #000000 0%, #181818 50%, #303030 100%);
+background: linear-gradient(to right, #000000 0%, #181818 50%,#303030 100%);
+filter: progid:DXImageTransform.Microsoft.gradient( startColorstr='#323b44', endColorstr='#586b81',GradientType=1 ); }
   line-height: 1.6;
   font-weight: 400;
   font-family:  'Inconsolata', 'Noto Sans JP', sans-serif;
