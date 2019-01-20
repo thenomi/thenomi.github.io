@@ -1,12 +1,32 @@
-@import 'https://fonts.googleapis.com/css?family=EB+Garamond';
+@import url('https://fonts.googleapis.com/css?family=Inconsolata');
 body {
   background-color: #000;
   line-height: 1.6;
   font-weight: 400;
-  font-family: 'EB Garamond', serif;
+  font-family:  'Inconsolata', 'Noto Sans JP', sans-serif;
   color: #fff;
   font-size:1.5em;
 }
+  @font-face {
+      font-family: 'Noto Sans JP';
+      font-style: normal;
+      font-weight: 400;
++    src: local("Noto Sans CJK JP Regular"),
+           url(//fonts.gstatic.com/ea/notosansjp/v5/NotoSansJP-Regular.woff2) format('woff2'),
+           url(//fonts.gstatic.com/ea/notosansjp/v5/NotoSansJP-Regular.woff) format('woff'),
+           url(//fonts.gstatic.com/ea/notosansjp/v5/NotoSansJP-Regular.otf) format('opentype');
+   }
+ /*****
+ blue #6B95FF
+ green #24e727
+ grey #323B44
+ grey2 #586B81
+ grey3 #4B5468
+ grey4:#171c21
+ emerald #00FF59
+ red: #b51e1e
+ purple: #766fa5
+ ***/
 .content{
   float:left;
   margin-left:5%;
@@ -20,12 +40,12 @@ a {
 font-style:italic;
 font-weight:bold;
 text-decoration:none;
-font-family: 'EB Garamond', serif;
+font-family: 'Inconsolata', 'Noto Sans JP', sans-serif;
 }
 .strong {
 font-weight:bold;
 text-decoration:none;
-font-family: 'EB Garamond', serif;
+font-family: 'Inconsolata', 'Noto Sans JP', sans-serif;
 }
 a:hover {
   color: #01194f;
@@ -37,13 +57,14 @@ a:hover {
     line-height:1.6em;
     }
 ::selection {
-  background: #fff; /* WebKit/Blink Browsers */
-  color:#000;
-}
+  color: #171c21;
+  background: #00FF59;
+  text-shadow: none; }
+
 ::-moz-selection {
-  background: #fff
-  color:#000; /* Gecko Browsers */
-}
+  color: #171c21;
+  background: #00FF59;
+  text-shadow: none; }
 
 .intrinsic-container {
   position: relative;
@@ -51,6 +72,25 @@ a:hover {
   overflow: hidden;
 }
  
+.h1,
+.h2,
+.h3,
+.h4,
+.h5,
+.h6 {
+  margin: 0 0 20px 0;
+  background: -webkit-linear-gradient(#24e727, #6B95FF);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  font-family: 'Inconsolata','Noto Sans JP',  sans-serif;
+  font-weight: bold;
+  line-height: 1.2;
+  letter-spacing: normal;
+  text-transform: uppercase;
+  text-shadow: none;
+  word-wrap: break-word;}
+
+
 /* 16x9 Aspect Ratio */
 .intrinsic-container-16x9 {
   padding-bottom: 56.25%;
@@ -86,4 +126,88 @@ a:hover {
   background: #000;
   color:#fff;
 	font-weight:bold;
+}
+/** change colours grey **/
+.change {
+   /* width: 100px;
+    height: 100px;
+    background-color: red; */
+    position: relative;
+    -webkit-animation-name: colours; /* Safari 4.0 - 8.0 */
+    -webkit-animation-duration: 4s; /* Safari 4.0 - 8.0 */
+    -webkit-animation-iteration-count: infinite; /* Safari 4.0 - 8.0 */
+    animation-name: colours;
+    animation-duration: 4s;
+    animation-iteration-count: infinite;
+}
+
+/* Safari 4.0 - 8.0 */
+@-webkit-keyframes colours {
+    0%   {background-color:#fff; left:0px; top:0px;}
+    25%  {background-color:#4B5468; left:0px; top:0px;}
+    50%  {background-color:#323B44; left:0px; top:0px;}
+    75%	 {background-color:#4B5468; left:0px; top:0px;}
+    100% {background-color:#fff; left:0px; top:0px;}
+}
+
+/* Standard syntax */
+@keyframes colours {
+    0%   {background-color:#fff; left:0px; top:0px;}
+    25%  {background-color:#4B5468; left:0px; top:0px;}
+    50%  {background-color:#fff; left:0px; top:0px;}
+    75%	 {background-color:#4B5468; left:0px; top:0px;}
+    100% {background-color:#fff; left:0px; top:0px;}
+}
+/** change colours **/
+/* blue #6B95FF
+ green #24e727
+ grey #323B44
+ grey2 #586B81
+ grey3 #4B5468
+ grey4:#171c21
+ emerald #00FF59
+ red: #b51e1e
+ purple: #766fa5
+ */
+.change2 {
+   /* width: 100px;
+    height: 100px;
+    background-color: red; */
+    position: relative;
+    -webkit-animation-name: green; /* Safari 4.0 - 8.0 */
+    -webkit-animation-duration: .2s; /* Safari 4.0 - 8.0 */
+    -webkit-animation-iteration-count: infinite; /* Safari 4.0 - 8.0 */
+    animation-name: green;
+    animation-duration: .2s;
+    animation-iteration-count: infinite;
+}
+
+/* Safari 4.0 - 8.0 */
+@-webkit-keyframes green {
+    0%   {background-color:#24e727; left:0px; top:0px;}
+    50%  {background-color:#6B95FF; left:0px; top:0px;}
+    100% {background-color:#24e727; left:0px; top:0px;}
+}
+
+/* Standard syntax */
+@keyframes green {
+    0%   {background-color:#24e727; left:0px; top:0px;}
+    50%  {background-color:#6B95FF; left:0px; top:0px;}
+    100% {background-color:#24e727; left:0px; top:0px;}
+}
+.shadowred {
+text-shadow: 5px 5px #b51e1e;
+color: #fff;
+}
+.red {
+color:#b51e1e;
+}
+.purple{
+color:#766fa5;
+}
+.blue {
+color: #6B95FF;
+}
+.green {
+color: #24e727;
 }
