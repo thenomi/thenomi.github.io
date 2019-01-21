@@ -38,7 +38,12 @@ filter: progid:DXImageTransform.Microsoft.gradient( startColorstr='#000000', end
   margin-right:5%;
 }
 a {
-  color:#039cfd;
+   color: #fff;
+  text-decoration:underline;
+  font-weight:bold;
+  -webkit-transition: color .15s ease;
+  -moz-transition: color .15s ease;
+  transition: color .15s ease; }
 }
 .em {
 font-style:italic;
@@ -52,8 +57,12 @@ text-decoration:none;
 font-family: 'Inconsolata', 'Noto Sans JP', sans-serif;
 }
 a:hover {
-  color: #01194f;
-  }
+ color: #171c21;
+  background:#24e727;
+  text-shadow: none;
+  text-decoration:underline;
+  border: none; }
+
     ul{
     list-style-type: none;
     padding: 5px;
