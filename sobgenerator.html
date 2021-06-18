@@ -1,0 +1,2885 @@
+<html lang="en"><head>
+    <title>flickguy</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=700, initial-scale=1.0">
+    <!-- scripts-->
+    <script>async function start() {
+    // init player and editor
+    const player = await makePlayer();
+    const editor = await makeEditor();
+
+    // setup play/edit buttons to switch between modes
+    const play = ui.action("play", playFromEditor);
+    const edit = ui.action("edit", editFromPlayer);
+
+    const playerContainer = ONE("#player");
+    const editorContainer = ONE("#editor");
+
+    function showPlayer() {
+        playerContainer.hidden = false;
+        editorContainer.hidden = true;
+        player.enter();
+    }
+
+    function showEditor() {
+        playerContainer.hidden = true;
+        editorContainer.hidden = false;
+        editor.enter();
+    }
+
+    async function playFromEditor() {
+        await player.copyFrom(editor.stateManager);
+        showPlayer();
+    }
+
+    async function editFromPlayer() {
+        await editor.stateManager.copyFrom(player.stateManager);
+        showEditor();
+    }
+
+    // determine if there is a project bundle embedded in this page
+    const bundle = maker.bundleFromHTML(document);
+
+    if (bundle) {
+        // embedded project, load it in the player
+        editor.helpContainer.hidden = false;
+        await player.loadBundle(bundle);
+        showPlayer();
+    } else {
+        // no embedded project, start editor blank
+        await editor.resetProject();
+        showEditor();
+    }
+}
+
+    </script>
+    <script>"strict"
+const maker = {};
+const ui = {};
+
+/**
+ * @template TProject
+ * @typedef {(project: TProject) => string[]} maker.ManifestFunction
+ */
+
+/**
+ * @typedef {Object} ResourceData
+ * @property {string} type
+ * @property {any} data
+ */
+
+/**
+ * @typedef {Object.<string, ResourceData>} maker.ResourceBundle
+ */
+
+/**
+ * @template TProject
+ * @typedef {Object} maker.ProjectBundle
+ * @property {TProject} project
+ * @property {maker.ResourceBundle} resources
+ */
+
+/**
+ * @template TData
+ * @template TInstance
+ * @typedef {Object} maker.ResourceHandler
+ * @property {(data: TData) => Promise<TInstance>} load
+ * @property {(instance: TInstance) => Promise<TInstance>} copy
+ * @property {(instance: TInstance) => Promise<TData>} save
+ */
+
+/** @type {Map<string, maker.ResourceHandler<any, any>>} */
+maker.resourceHandlers = new Map();
+
+maker.ResourceManager = class {
+    constructor() {
+        this.lastId = 0;
+        /** @type {Map<string, { type: string, instance: any }>} */
+        this.resources = new Map();
+    }
+
+    /**
+     * Generate a new unique id for a resource.
+     * @returns {string}
+     */
+    generateId() {
+        this.lastId += 1;
+        // just next lowest unused number
+        while (this.resources.has(this.lastId.toString())) {
+            this.lastId += 1;
+        }
+
+        return this.lastId.toString();
+    }
+    
+    /**
+     * Clear all resources.
+     */
+    clear() {
+        this.resources.clear();
+    }
+
+    /**
+     * Get the resource instance with the given id.
+     * @param {string} id 
+     * @returns {any}
+     */
+    get(id) {
+        return this.resources.get(id)?.instance;
+    }
+
+    /**
+     * Add a resource instance at a specific id.
+     * @param {string} id 
+     * @param {any} instance 
+     * @param {string} type 
+     */
+    set(id, instance, type) {
+        this.resources.set(id, { type, instance });
+    }
+
+    /**
+     * Add an instance as a new resource and return its new id.
+     * @param {any} instance 
+     * @param {string} type 
+     * @returns {string}
+     */
+    add(instance, type) {
+        const id = this.generateId();
+        this.set(id, instance, type);
+        return id;
+    }
+
+    /**
+     * Copy the existing resource with the given id and add it as a new resource.
+     * @param {string} id 
+     * @returns 
+     */
+    async fork(id) {
+        const source = this.resources.get(id);
+        const forkId = this.generateId();
+        const instance = await maker.resourceHandlers.get(source.type).copy(source.instance); 
+        this.set(forkId, instance, source.type);
+        return { id: forkId, instance };
+    }
+
+    /**
+     * Discard all resources except those at the ids given.
+     * @param {Iterable<string>} keepIds 
+     */
+    prune(keepIds) {
+        const ids = new Set(keepIds);
+
+        this.resources.forEach((_, id) => {
+            if (!ids.has(id)) this.resources.delete(id);
+        });
+    }
+
+    /**
+     * Copy all resources from another resource manager.
+     * @param {maker.ResourceManager} other 
+     */
+    async copyFrom(other) {
+        const tasks = [];
+        Array.from(other.resources).forEach(([id, { type, instance }]) => {
+            const task = maker.resourceHandlers.get(type)
+                         .copy(instance)
+                         .then((copy) => this.set(id, copy, type));
+            tasks.push(task);
+        });
+
+        return Promise.all(tasks);
+    }
+
+    /**
+     * Save all resources in an object mapping id to type and save data.
+     * @param {Iterable<string>} ids 
+     * @returns {Promise<maker.ResourceBundle>}
+     */
+    async save(ids) {
+        /** @type {maker.ResourceBundle} */
+        const bundle = {};
+
+        const resourceIds = new Set(ids);
+        const relevant = Array.from(this.resources)
+                         .filter(([id]) => resourceIds.has(id));
+
+        const tasks = [];
+        Array.from(relevant).forEach(([id, { type, instance }]) => {
+            const task = maker.resourceHandlers.get(type)
+                         .save(instance)
+                         .then((data) => bundle[id] = { type, data });
+            tasks.push(task);
+        });
+
+        await Promise.all(tasks);
+        return bundle;
+    }
+
+    /**
+     * Load all resources from the given bundle.
+     * @param {maker.ResourceBundle} bundle 
+     */
+    async load(bundle) {
+        const tasks = [];
+        Object.entries(bundle).forEach(([id, { type, data }]) => {
+            const task = maker.resourceHandlers.get(type)
+                         .load(data)
+                         .then((instance) => this.set(id, instance, type));
+            tasks.push(task);
+        });
+        return Promise.all(tasks);
+    }
+}
+
+/**
+ * 
+ * @template TState
+ */
+maker.StateManager = class extends EventTarget {
+    /**
+     * Create a state manager, optionally providing a function that describes
+     * how to determine resource dependencies of a given state. 
+     * @param {maker.ManifestFunction<TState>} getManifest 
+     */
+    constructor(getManifest = undefined) {
+        super();
+
+        this.getManifest = getManifest || (() => []);
+        this.resources = new maker.ResourceManager();
+
+        /** @type {TState[]} */
+        this.history = [];
+        this.index = -1;
+        this.historyLimit = 20;
+    }
+
+    /**
+     * The present state in history.
+     */
+    get present() {
+        return this.history[this.index];
+    }
+
+    /**
+     * Is there any edit history to undo to?
+     */
+    get canUndo() {
+        return this.index > 0;
+    }
+
+    /**
+     * Are there any undone edits to redo?
+     */
+    get canRedo() {
+        return this.index < this.history.length - 1;
+    }
+
+    /**
+     * Replace all state with the project and resources in the given project
+     * bundle.
+     * @param {maker.ProjectBundle<TState>} bundle
+     */
+    async loadBundle(bundle) {
+        this.history.length = 0;
+        this.history.push(bundle.project);
+        this.index = 0;
+        this.resources.clear();
+        await this.resources.load(bundle.resources);
+
+        this.changed();
+    }
+
+    /**
+     * Replace all state by copying from another state manager.
+     * @param {maker.StateManager<TState>} other 
+     */
+    async copyFrom(other) {
+        this.history = COPY(other.history);
+        this.index = other.index;
+        this.resources.clear();
+        await this.resources.copyFrom(other.resources);
+        
+        this.changed();
+    }
+    
+    /**
+     * Copy the present state and dependent resources into a project bundle.
+     * @returns {Promise<maker.ProjectBundle<TState>>}
+     */
+    async makeBundle() {
+        const project = COPY(this.present);
+        const resources = await this.resources.save(this.getManifest(this.present));
+
+        return { project, resources };
+    }
+
+    /**
+     * Save the current state as a checkpoint in history that can be returned to
+     * with undo/redo.
+     */
+    makeCheckpoint() {
+        this.history.length = this.index + 1;
+        
+        const currentData = this.present;
+
+        this.history[this.index] = COPY(currentData);
+        this.history.push(currentData);
+        
+        if (this.index < this.historyLimit) {
+            this.index += 1;
+        } else {
+            // delete earliest history
+            this.history.splice(0, 1);
+            this.pruneResources();
+        }
+    }
+
+    /**
+     * Dispatch the change event signalling that the present state has been
+     * updated.
+     */
+    changed() {
+        this.dispatchEvent(new CustomEvent("change"));
+    }
+
+    /**
+     * Discard all resources that are no longer required accord to the manifest
+     * function.
+     */
+    pruneResources() {
+        this.resources.prune(this.history.flatMap(this.getManifest));
+    }
+
+    /**
+     * Make a history checkpoint, replace the current state with a forked
+     * version via callback, and then dispatch the change event.
+     * @param {(data: TState) => Promise} action 
+     */
+    async makeChange(action) {
+        this.makeCheckpoint();
+        await action(this.present);
+        this.changed();
+    }
+
+    /**
+     * Revert the state to the previous checkpoint in history.
+     */
+    undo() {
+        if (!this.canUndo) return;
+        this.index -= 1;
+        this.changed();
+    }
+
+    /**
+     * Return the state to the most recently undone checkpoint in history.
+     */
+    redo() {
+        if (!this.canRedo) return;
+        this.index += 1;
+        this.changed();
+    }
+};
+
+/**
+ * Ask the browser to download the given blob as a file with the given name.
+ * @param {Blob} blob 
+ * @param {string} name
+ */
+maker.saveAs = function(blob, name) {
+    const element = document.createElement("a");
+    const url = window.URL.createObjectURL(blob);
+    element.href = url;
+    element.download = name;
+    element.click();
+    window.URL.revokeObjectURL(url);
+};
+
+/**
+ * Open the browser file picker, optionally restricted to files of a given file
+ * type pattern and optionally accepting multiple files. 
+ * @param {string} accept 
+ * @param {boolean} multiple 
+ * @returns {Promise<File[]>}
+ */
+ maker.pickFiles = async function(accept = "*", multiple = false) {
+    return new Promise((resolve) => {
+        const fileInput = html("input", { type: "file", accept, multiple });
+        fileInput.addEventListener("change", () => resolve(Array.from(fileInput.files)));
+        fileInput.click();
+    });
+}
+
+/**
+ * Read plain text from a file.
+ * @param {File} file 
+ * @return {Promise<string>}
+ */
+maker.textFromFile = async function(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = reject;
+        reader.onload = () => resolve(/** @type {string} */ (reader.result));
+        reader.readAsText(file); 
+    });
+}
+
+/**
+ * Read image from a file.
+ * @param {File} file 
+ * @return {Promise<string>}
+ */
+maker.dataURIFromFile = async function(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = reject;
+        reader.onload = () => resolve(/** @type {string} */ (reader.result));
+        reader.readAsDataURL(file); 
+    });
+}
+
+/**
+ * Create a DOM for an html page from html source code
+ * @param {string} source
+ * @returns 
+ */
+maker.htmlFromText = function(source) {
+    const template = document.createElement('template');
+    template.innerHTML = source;
+    return template.content;
+}
+
+/**
+ * @param {string} text 
+ */
+maker.textToBlob = function(text, type = "text/plain") {
+    return new Blob([text], { type });
+}
+
+/**
+ * 
+ * @param {ParentNode} html 
+ */
+maker.bundleFromHTML = function(html, query="#bundle-embed") {
+    const json = ONE(query, html)?.textContent;
+    const bundle = json ? JSON.parse(json) : undefined;
+    return bundle;
+}
+
+class RadioGroupWrapper extends EventTarget {
+    /** @param {HTMLInputElement[]} inputs */
+    constructor(inputs) {
+        super();
+        this.inputs = inputs;
+
+        inputs.forEach((input) => {
+            input.addEventListener("change", () => {
+                if (!input.checked) return;
+                this.dispatchEvent(new CustomEvent("change"));
+            });
+        });
+    }
+
+    get selectedIndex() {
+        return this.inputs.findIndex((button) => button.checked); 
+    }
+
+    set selectedIndex(value) {
+        this.inputs[value].click();
+    }
+
+    get selectedInput() {
+        return this.inputs[this.selectedIndex];
+    }
+
+    get value() {
+        return this.selectedInput?.value;
+    }
+}
+
+class CheckboxWrapper extends EventTarget {
+    /** @param {HTMLInputElement[]} inputs */
+    constructor(inputs) {
+        super();
+        this.inputs = inputs;
+
+        inputs.forEach((input) => {
+            input.addEventListener("change", () => {
+                this.dispatchEvent(new CustomEvent("change"));
+                inputs.forEach((input) => input.checked = input.checked);
+            });
+        });
+    }
+
+    get checked() {
+        return this.inputs[0].checked; 
+    }
+
+    set checked(value) {
+        if (this.checked !== value) this.inputs[0].click();
+    }
+}
+
+class ButtonAction extends EventTarget {
+    /** @param {HTMLButtonElement[]} buttons */
+    constructor(buttons) {
+        super();
+        this.buttons = buttons;
+        this.disabled = false;
+
+        buttons.forEach((button) => {
+            button.addEventListener("click", () => this.invoke());
+        });
+    }
+
+    get disabled() {
+        return this._disabled;
+    }
+
+    set disabled(value) {
+        this._disabled = value;
+        this.buttons.forEach((button) => button.disabled = value);
+    }
+
+    invoke(force = false) {
+        if (!force && this.disabled) return;
+        this.dispatchEvent(new CustomEvent("invoke"));
+    }
+}
+
+/**
+ * Get a wrapper for the radio input elements sharing the given name.
+ * @param {string} name
+ * @returns {RadioGroupWrapper}
+ */
+ui.radio = (name) => new RadioGroupWrapper(ALL(`input[type="radio"][name="${name}"]`));
+
+ui.toggle = (name) => new CheckboxWrapper(ALL(`input[type="checkbox"][name="${name}"]`));
+
+/**
+ * Get an action linked to all button elements sharing the given name. 
+ * Optionally provide a default listener for the action.
+ * @param {string} name
+ * @param {() => void} listener
+ * @returns {ButtonAction}
+ */
+ui.action = function (name, listener=undefined) {
+    const action = new ButtonAction(ALL(`button[name="${name}"]`));
+    if (listener) action.addEventListener("invoke", listener);
+    return action;
+}
+
+/**
+ * Get the html select element with the given name.
+ * @param {string} name
+ * @returns {HTMLSelectElement}
+ */
+ui.select = (name) => ONE(`select[name="${name}"]`);
+
+/**
+ * Get a child element matching CSS selector.
+ * @param {string} query 
+ * @param {ParentNode} element 
+ * @returns {HTMLElement}
+ */
+const ONE = (query, element = undefined) => (element || document).querySelector(query);
+
+/**
+ * Get all children elements matching CSS selector.
+ * @param {string} query 
+ * @param {HTMLElement | Document} element 
+ * @returns {HTMLElement[]}
+ */
+const ALL = (query, element = undefined) => Array.from((element || document).querySelectorAll(query));
+
+ui.PointerDrag = class extends EventTarget {
+    /** 
+     * @param {MouseEvent} event
+     */
+    constructor(event, { clickMovementLimit = 5 } = {}) {
+        super();
+        this.pointerId = event["pointerId"];
+        this.clickMovementLimit = 5;
+        this.totalMovement = 0;
+
+        this.downEvent = event;
+        this.lastEvent = event; 
+
+        this.listeners = {
+            "pointerup": (event) => {
+                if (event.pointerId !== this.pointerId) return;
+
+                this.lastEvent = event;
+                this.unlisten();
+                this.dispatchEvent(new CustomEvent("up", { detail: event }));
+                if (this.totalMovement <= clickMovementLimit) {
+                    this.dispatchEvent(new CustomEvent("click", { detail: event }));
+                }
+            },
+
+            "pointermove": (event) => {
+                if (event.pointerId !== this.pointerId) return;
+
+                this.totalMovement += Math.abs(event.movementX);
+                this.totalMovement += Math.abs(event.movementY);
+                this.lastEvent = event;
+                this.dispatchEvent(new CustomEvent("move", { detail: event }));
+            }
+        }
+
+        document.addEventListener("pointerup", this.listeners.pointerup);
+        document.addEventListener("pointermove", this.listeners.pointermove);
+    }
+
+    unlisten() {
+        document.removeEventListener("pointerup", this.listeners.pointerup);
+        document.removeEventListener("pointermove", this.listeners.pointermove);
+    }
+}
+
+/**
+ * Wrap a pointer down event and track its subsequent movement until release.
+ * @param {PointerEvent} event 
+ * @returns {ui.PointerDrag}
+ */
+ui.drag = (event) => new ui.PointerDrag(event);
+
+/**
+ * @param {HTMLCanvasElement} canvas 
+ * @param {MouseEvent} event 
+ */
+ function mouseEventToCanvasPixelCoords(canvas, event) {
+    const bounds = canvas.getBoundingClientRect();
+    const [mx, my] = [event.clientX - bounds.x, event.clientY - bounds.y];
+    const scale = canvas.width / canvas.clientWidth; 
+    const [px, py] = [Math.floor(mx * scale), Math.floor(my * scale)];
+    return { x: px, y: py };
+}
+
+/**
+ * Deep copy an object by serializing it to json and parsing it again.
+ * @template T
+ * @param {T} object
+ * @returns {T}
+ */
+const COPY = (object) => JSON.parse(JSON.stringify(object));
+
+/**
+ * Create an array of zeroes to the given length.
+ * @param {number} length 
+ * @returns {number[]}
+ */
+const ZEROES = (length) => Array(length).fill(0);
+
+/**
+ * Create an array of a value repeated to the given length.
+ * @template T
+ * @param {number} length 
+ * @param {T} value
+ * @returns {T[]}
+ */
+ const REPEAT = (length, value) => Array(length).fill(value);
+
+/**
+ * Create an html element with the given attributes and children.
+ * @template {keyof HTMLElementTagNameMap} K
+ * @param {K} tagName 
+ * @param {*} attributes 
+ * @param  {...(Node | string)} children 
+ * @returns {HTMLElementTagNameMap[K]}
+ */
+ function html(tagName, attributes = {}, ...children) {
+    const element = /** @type {HTMLElementTagNameMap[K]} */ (document.createElement(tagName)); 
+    Object.entries(attributes).forEach(([name, value]) => element.setAttribute(name, value));
+    children.forEach((child) => element.append(child));
+    return element;
+}
+
+    </script>
+    <script>/**
+ * @param {number} width
+ * @param {number} height
+ * @returns {CanvasRenderingContext2D}
+ */
+function createRendering2D(width, height) {
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext('2d');
+    context.imageSmoothingEnabled = false;
+    return context;
+}
+
+/**
+ * @param {CanvasRenderingContext2D} rendering 
+ * @param {string | CanvasGradient | CanvasPattern | undefined} fillStyle
+ */
+function fillRendering2D(rendering, fillStyle = undefined) {
+    if (fillStyle !== undefined) {
+        const prevStyle = rendering.fillStyle;
+        rendering.fillStyle = fillStyle;
+        rendering.fillRect(0, 0, rendering.canvas.width, rendering.canvas.height);
+        rendering.fillStyle = prevStyle;
+    } else {
+        rendering.clearRect(0, 0, rendering.canvas.width, rendering.canvas.height);
+    }
+}
+
+/**
+ * @param {CanvasRenderingContext2D} rendering
+ * @param {CanvasRenderingContext2D} destination
+ */
+function copyRendering2D(rendering, destination = undefined) {
+    destination = destination || createRendering2D(rendering.canvas.width, rendering.canvas.height);
+    destination.canvas.width = rendering.canvas.width;
+    destination.canvas.height = rendering.canvas.height;
+    destination.drawImage(rendering.canvas, 0, 0);
+    return destination;
+}
+
+/**
+
+ * @param {CanvasRenderingContext2D} rendering 
+ * @param {number} width 
+ * @param {number} height 
+ */
+function resizeRendering2D(rendering, width, height) {
+    const copy = copyRendering2D(rendering);
+    rendering.canvas.width = width;
+    rendering.canvas.height = height;
+    rendering.drawImage(copy.canvas, 0, 0);
+}
+
+/**
+ * @callback pixelsAction
+ * @param {Uint32Array} pixels
+ */
+
+/**
+ * @param {CanvasRenderingContext2D} rendering 
+ * @param {pixelsAction} action 
+ */
+function withPixels(rendering, action) {
+    const imageData = rendering.getImageData(0, 0, rendering.canvas.width, rendering.canvas.height);
+    action(new Uint32Array(imageData.data.buffer));
+    rendering.putImageData(imageData, 0, 0);
+}
+
+/**
+ * @param {CanvasRenderingContext2D} mask 
+ * @param {string} style 
+ */
+function recolorMask(mask, style) {
+    const recolored = copyRendering2D(mask);
+    recolored.globalCompositeOperation = "source-in";
+    fillRendering2D(recolored, style);
+    return recolored;
+}
+
+/**
+ * @param {number} x0 
+ * @param {number} y0 
+ * @param {number} x1 
+ * @param {number} y1 
+ * @param {(x: number, y: number) => void} plot 
+ */
+// adapted from https://stackoverflow.com/a/34267311
+function lineplot(x0, y0, x1, y1, plot) {
+    x0 |= 0; y0 |= 0; x1 |= 0; y1 |= 0;
+
+    const steep = Math.abs(y1 - y0) > Math.abs(x1 - x0);
+    if (steep) [x0, y0, x1, y1] = [y0, x0, y1, x1];
+
+    const dx = Math.abs(x1 - x0);
+    const dy = Math.abs(y1 - y0);
+    const ystep = Math.sign(y1 - y0);
+    const xstep = Math.sign(x1 - x0);
+
+    let err = Math.floor(dx / 2);
+    let y = y0;
+
+    if (dx === 0 && dy === 0) {
+        plot(x0, y0);
+    }
+
+    for (let x = x0; x != (x1 + xstep); x += xstep) {
+        plot(steep ? y : x, steep ? x : y);
+        err -= dy;
+        if (err < 0) {
+            y += ystep;
+            err += dx;
+        }
+    }
+}
+
+/**
+ * @param {CanvasRenderingContext2D} rendering 
+ * @param {number} x 
+ * @param {number} y 
+ * @param {number} color
+ */
+function floodfill(rendering, x, y, color) {
+    const [width, height] = [rendering.canvas.width, rendering.canvas.height];
+    withPixels(rendering, pixels => {
+        const queue = [[x, y]];
+        const done = new Array(width * height);
+        const initial = pixels[y * width + x];
+
+        function enqueue(x, y) {
+            const within = x >= 0 && y >= 0 && x < width && y < height;
+
+            if (within && pixels[y * width + x] === initial && !done[y * width + x]) {
+                queue.push([x, y]);
+            }
+        }
+
+        while (queue.length > 0) {
+            const [x, y] = queue.pop();
+            pixels[y * width + x] = color;
+            done[y * width + x] = true;
+
+            enqueue(x - 1, y);
+            enqueue(x + 1, y);
+            enqueue(x, y - 1);
+            enqueue(x, y + 1);
+        }
+    });
+};
+
+/**
+ * @param {CanvasRenderingContext2D} rendering 
+ * @param {number} x 
+ * @param {number} y 
+ * @param {number} color
+ * @returns {CanvasRenderingContext2D}
+ */
+ function floodfillOutput(rendering, x, y, color) {
+    const [width, height] = [rendering.canvas.width, rendering.canvas.height];
+    const output = createRendering2D(width, height);
+    withPixels(rendering, srcPixels =>
+    withPixels(output, dstPixels => {
+        const queue = [[x, y]];
+        const done = new Array(width * height);
+        const initial = srcPixels[y * width + x];
+
+        function enqueue(x, y) {
+            const within = x >= 0 && y >= 0 && x < width && y < height;
+
+            if (within && srcPixels[y * width + x] === initial && !done[y * width + x]) {
+                queue.push([x, y]);
+            }
+        }
+
+        while (queue.length > 0) {
+            const [x, y] = queue.pop();
+            dstPixels[y * width + x] = color;
+            done[y * width + x] = true;
+
+            enqueue(x - 1, y);
+            enqueue(x + 1, y);
+            enqueue(x, y - 1);
+            enqueue(x, y + 1);
+        }
+    }));
+    return output;
+};
+
+/**
+ * @param {{r:number,g:number,b:number}} rgb 
+ */
+function rgbToHex(rgb) {
+    const packed = (0xFF000000 + (rgb.r << 16) + (rgb.g << 8) + (rgb.b << 0));
+    return "#" + packed.toString(16).substr(-6);
+}
+
+/**
+ * @param {string} hex 
+ * @param {number} alpha
+ */
+function hexToUint32(hex, alpha = undefined) {
+    if (hex.charAt(0) === '#') hex = hex.substring(1);
+    if (alpha === undefined && hex.length === 8) alpha = parseInt(hex.substr(6, 2), 16);
+    if (alpha === undefined) alpha = 255;
+    hex = hex.substr(4, 2) + hex.substr(2, 2) + hex.substr(0, 2);
+    return (parseInt(hex, 16) | (alpha << 24)) >>> 0;
+}
+
+/**
+ * @param {number} number
+ * @param {string} prefix 
+ */
+function numberToHex(number, prefix = '#') {
+    number = (number | 0xff000000) >>> 0;
+    let hex = number.toString(16).substring(2, 8);
+    hex = hex.substr(4, 2) + hex.substr(2, 2) + hex.substr(0, 2);
+    return prefix + hex;
+}
+
+const MASK_PALETTE = {
+    '_': hexToUint32('#000000', 0),
+    default: hexToUint32('#FFFFFF', 255),
+};
+
+/**
+ * @param {string} text 
+ * @param {Record<string, number>} palette 
+ * @returns {CanvasRenderingContext2D}
+ */
+function textToRendering2D(text, palette = MASK_PALETTE) {
+    text = text.trim();
+    const lines = text.split('\n').map((line) => [...line.trim()]);
+
+    const width = lines[0].length;
+    const height = lines.length;
+
+    const rendering = createRendering2D(width, height);
+    withPixels(rendering, (pixels) => {
+        lines.forEach((line, y) => line.forEach((char, x) => {
+            const color = palette[char];
+            pixels[y * width + x] = color !== undefined ? color : palette.default;
+        }));
+    });
+
+    return rendering;
+}
+
+/**
+ * @param {{ h: number, s: number, v: number }} hsv
+ */
+function HSVToRGB(hsv) {
+    const { h, s, v } = hsv;
+    let r, g, b;
+    const i = Math.floor(h * 6);
+    const f = h * 6 - i;
+    const p = (1 - s);
+    const q = (1 - f * s);
+    const t = (1 - (1 - f) * s);
+    switch (i % 6) {
+        case 0: r = 1, g = t, b = p; break;
+        case 1: r = q, g = 1, b = p; break;
+        case 2: r = p, g = 1, b = t; break;
+        case 3: r = p, g = q, b = 1; break;
+        case 4: r = t, g = p, b = 1; break;
+        case 5: r = 1, g = p, b = q; break;
+    }
+
+    r *= v * 255;
+    g *= v * 255;
+    b *= v * 255;
+
+    return { r, g, b };
+}
+
+/**
+ * @param {{ r: number, g: number, b: number }} rgb
+ */
+function RGBToHSV(rgb) {
+    const { r, g, b } = rgb;
+    var max = Math.max(r, g, b), min = Math.min(r, g, b),
+        d = max - min,
+        h,
+        s = (max === 0 ? 0 : d / max),
+        v = max / 255;
+
+    switch (max) {
+        case min: h = 0; break;
+        case r: h = (g - b) + d * (g < b ? 6: 0); h /= 6 * d; break;
+        case g: h = (b - r) + d * 2; h /= 6 * d; break;
+        case b: h = (r - g) + d * 4; h /= 6 * d; break;
+    }
+
+    return { h, s, v };
+}
+
+function HSVToCone(hsv) {
+    const a = Math.PI * hsv.h;
+    const r = hsv.s * .5 * hsv.v;
+    const x = Math.cos(a) * r;
+    const y = Math.sin(a) * r;
+    return { x, y, z: hsv.v };
+}
+
+
+function uint32ToRGB(uint32) {
+    return {
+        r: uint32 >>>  0 & 0xFF,
+        g: uint32 >>>  8 & 0xFF,
+        b: uint32 >>> 16 & 0xFF,
+        uint32,
+    };
+}
+
+function hexToRGB(hex) {
+    if (hex.charAt(0) === '#') hex = hex.substring(1);
+    return {
+        b: parseInt(hex.substr(4, 2), 16),
+        g: parseInt(hex.substr(2, 2), 16),
+        r: parseInt(hex.substr(0, 2), 16),
+        uint32: hexToUint32(hex),
+    };
+}
+
+function RGBToUint32(rgb) {
+    return rgb.r | rgb.g << 8 | rgb.b << 16 | 0xFF << 24;
+}
+
+/**
+ * @param {CanvasRenderingContext2D} rendering 
+ * @param {string[]} palette 
+ */
+function recolorToPalette(rendering, palette) {
+    const paletteConverted = palette.map((hex) => { 
+        const cone = HSVToCone(RGBToHSV(hexToRGB(hex)));
+        const uint32 = hexToUint32(hex);
+        return { ...cone, uint32 };
+    });
+    const mapping = new Map();
+
+    function chooseColor(uint32) {
+        const alpha = (uint32 >>> 24) < 16;
+        if (alpha) return 0;
+
+        const existing = mapping.get(uint32);
+        if (existing) return existing;
+
+        const actual = HSVToCone(RGBToHSV(uint32ToRGB(uint32)));
+        let bestSqrDistance = Infinity;
+        let best = paletteConverted[0];
+
+        for (let candidate of paletteConverted) {
+            const dx = Math.abs(actual.x - candidate.x);
+            const dy = Math.abs(actual.y - candidate.y);
+            const dz = Math.abs(actual.z - candidate.z);
+            const sqrDistance = dx*dx + dy*dy + dz*dz;
+            
+            if (sqrDistance < bestSqrDistance) {
+                bestSqrDistance = sqrDistance;
+                best = candidate;
+            }
+        }
+
+        mapping.set(uint32, best.uint32);
+        return best.uint32;
+    }
+
+    withPixels(rendering, (pixels) => {
+        for (let i = 0; i < pixels.length; ++i) {
+            pixels[i] = chooseColor(pixels[i]);
+        }
+    });
+}
+
+/** 
+ * Copy image contents to a new canvas rendering context.
+ * @param {HTMLImageElement} image 
+ */
+function imageToRendering2D(image) {
+    const rendering = createRendering2D(image.naturalWidth, image.naturalHeight);
+    rendering.drawImage(image, 0, 0);
+    return rendering;
+}
+
+/**
+ * Create an html image from a given src (probably a datauri).
+ * @param {string} src
+ * @returns {Promise<HTMLImageElement>}
+ */
+async function loadImage(src) {
+    return new Promise((resolve, reject) => {
+        const image = document.createElement("img");
+        image.addEventListener("load", () => resolve(image));
+        image.addEventListener("error", reject);
+        image.src = src;
+    });
+}
+
+    </script>
+    <script>const crewmaker = {};
+
+// add a resource type called "canvas-datauri" that describes how to load a
+// canvas rendering context from a datauri, how to copy one, and how to convert
+// one back into a datauri
+maker.resourceHandlers.set("canvas-datauri", {
+    load: async (data) => imageToRendering2D(await loadImage(data)),
+    copy: async (instance) => copyRendering2D(instance),
+    save: async (instance) => instance.canvas.toDataURL(),
+});
+
+/**
+ * @typedef {Object} CrewmakerDataLayerOption
+ * @property {string} image
+ * @property {number} palette
+ */
+
+/**
+ * @typedef {Object} CrewmakerDataLayer
+ * @property {CrewmakerDataLayerOption[]} options
+ */
+
+/**
+ * @typedef {Object} CrewmakerDataProject
+ * @property {string[][]} palettes
+ * @property {CrewmakerDataLayer[]} layers
+ */
+
+/** 
+ * @param {CrewmakerDataProject} data 
+ * @returns {string[]}
+ */
+crewmaker.getManifest = function (data) {
+    // layer option images are the only resource dependencies in a crewmaker
+    return data.layers.flatMap((layer) => layer.options.map((option) => option.image));
+}
+
+crewmaker.layerWidth = 128;
+crewmaker.layerHeight = 128;
+
+/** @returns {maker.ProjectBundle<CrewmakerDataProject>} */
+crewmaker.makeBlankBundle = function () {
+    const blank = createRendering2D(crewmaker.layerWidth, crewmaker.layerHeight);
+    fillRendering2D(blank);
+    const layers = ZEROES(8).map(() => ({  
+        options: ZEROES(8).map(() => ({ image: "0", palette: 0 })),
+    }));
+    const project = { palettes: crewmaker.defaultPalettes, layers };
+    const resources = {
+        "0": { type: "canvas-datauri", data: blank.canvas.toDataURL() },
+    };
+
+    return { project, resources };
+}
+
+/**
+ * @param {CanvasRenderingContext2D} rendering 
+ * @param {string[]} prev 
+ * @param {string[]} next 
+ */
+function swapPalette(rendering, prev, next) {
+    const mapping = new Map();
+    prev.forEach((hex, index) => mapping.set(hexToUint32(prev[index]), hexToUint32(next[index])));
+
+    withPixels(rendering, (pixels) => {
+        for (let i = 0; i < pixels.length; ++i) {
+            pixels[i] = mapping.get(pixels[i]) || pixels[i];
+        }
+    });
+}
+
+/**
+ * @param {number} min 
+ * @param {number} max 
+ * @returns {number}
+ */
+ function getRandomInt(min, max) {
+    return Math.floor(Math.random() * (max - min)) + min;
+}
+
+// default palettes (8 palettes of 8 colors)
+crewmaker.defaultPalettes = [
+    ["#000000","#94216a","#ff2674","#ff80a4","#34111f","#73392e","#c76e46","#ffb762"],["#000000","#d62411","#ff8426","#ffd100","#73392e","#c76e46","#eb9c6e","#ffdaac"],["#000000","#007899","#10d275","#bfff3c","#430067","#94216a","#ff2674","#ff80a4"],["#000000","#94216a","#ff2674","#ff80a4","#002859","#007899","#10d275","#bfff3c"],["#000000","#d62411","#ff8426","#ffd100","#1b1023","#002859","#007899","#68aed4"],["#000000","#002859","#007899","#68aed4","#430067","#94216a","#ff2674","#ff80a4"],["#000000","#007899","#10d275","#bfff3c","#7f0622","#d62411","#ff8426","#ffd100"],["#000000","#002859","#007899","#68aed4","#7f0622","#d62411","#ff8426","#ffd100"]
+];
+
+// brush names and datauris
+crewmaker.brushes = [
+    { name: "1px circle", image: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAABlJREFUOI1jYBgFwx38/////0C7YRQMDQAApd4D/cefQokAAAAASUVORK5CYII=" },
+    { name: "2px circle", image: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAABpJREFUOI1jYBgFwx38hwJ8apjo5ZhRMKgBADvbB/vPRl6wAAAAAElFTkSuQmCC" },
+    { name: "3px circle", image: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAACNJREFUOI1jYBgFgxz8////PyE1jMRoZmRkxKmOYheMgmEBAARbC/qDr1pMAAAAAElFTkSuQmCC" },
+    { name: "4px circle", image: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAChJREFUOI1jYBgFgxz8hwJ8ahjxaUZRyMiIVS0TeW4jEhDjhVEwGAAAJhAT9IYiYRoAAAAASUVORK5CYII=" },
+];
+
+crewmaker.Editor = class extends EventTarget {
+    constructor() {
+        super();
+
+        this.editorMode = true;
+
+        // to determine which resources are still in use for the project we
+        // combine everything the crewmaker needs plus anything this editor
+        // needs
+        const getManifest = (data) => [...crewmaker.getManifest(data), ...this.getManifest()];
+
+        /** @type {maker.StateManager<CrewmakerDataProject>} */
+        this.stateManager = new maker.StateManager(getManifest);
+        /** @type {CanvasRenderingContext2D} */
+        this.rendering = ONE("#renderer").getContext("2d");
+
+        this.stackActive = createRendering2D(crewmaker.layerWidth, crewmaker.layerHeight);
+        this.stackUnder = createRendering2D(crewmaker.layerWidth, crewmaker.layerHeight);
+        this.stackOver = createRendering2D(crewmaker.layerWidth, crewmaker.layerHeight);
+        
+        this.preview = createRendering2D(this.rendering.canvas.width, this.rendering.canvas.height);
+        this.layerThumbs = ZEROES(8).map(() => createRendering2D(crewmaker.layerWidth, crewmaker.layerHeight));
+        this.optionThumbs = ZEROES(8).map(() => createRendering2D(crewmaker.layerWidth, crewmaker.layerHeight));
+        this.paletteThumbs = ZEROES(8).map(() => createRendering2D(1, 1));
+
+        // find all the ui already defined in the html
+        this.layerSelect = ui.radio("layer-select");
+        this.optionSelect = ui.radio("option-select");
+        this.paletteSelect = ui.radio("palette-select");
+        this.stackLayers = ui.toggle("stack-layers");
+
+        this.toolSelect = ui.radio("tool-select");
+        this.brushSelect = ui.radio("brush-select");
+        this.colorSelect = ui.radio("color-select");
+        this.helpContainer = ONE("#help");   
+
+        // initial selections
+        this.layerSelect.selectedIndex = 0;
+        this.optionSelect.selectedIndex = 0;
+        this.paletteSelect.selectedIndex = 0;
+
+        this.toolSelect.selectedIndex = 0;
+        this.brushSelect.selectedIndex = 0;
+        this.colorSelect.selectedIndex = 1;
+
+        this.selectedOptions = ZEROES(8);
+
+        // add thumbnails to the layer select bar
+        ALL("#layer-select input").forEach((input, index) => {
+            input.after(this.layerThumbs[index].canvas);
+        });
+
+        // add thumbnails to the option select bar
+        ALL("#option-select input").forEach((input, index) => {
+            input.after(this.optionThumbs[index].canvas);
+        });
+
+        // add thumbnails to the palette select bar
+        ALL("#palette-select input").forEach((input, index) => {
+            input.after(this.paletteThumbs[index].canvas);
+        });
+
+        // add brush icons and tooltips to brush select buttons
+        ALL("#brush-select label").forEach((label, index) => {
+            ONE("input", label).title = crewmaker.brushes[index].name + " brush";
+            ONE("img", label).src = crewmaker.brushes[index].image;
+        });
+
+        // state of the paint tools:
+        // is the color pick key held down?
+        this.heldColorPick = false;
+        // current brush and pattern recolored with current color
+        this.activeBrush = undefined;
+        this.activePattern = undefined;
+        // saved start coordinates during a line draw
+        this.lineStart = undefined;
+        // saved start coordinates during shift
+        this.shiftStart = undefined;
+        // layer option currently in the clipboard
+        this.copiedLayerOption = undefined;
+
+        // editor actions controlled by html buttons
+        this.actions = {
+            layerUp: ui.action("layer-up", () => this.shiftLayerUp()),
+            layerDown: ui.action("layer-down", () => this.shiftLayerDown()),
+
+            undo: ui.action("undo", () => this.stateManager.undo()),
+            redo: ui.action("redo", () => this.stateManager.redo()),
+            copy: ui.action("copy", () => this.copyLayerOption()),
+            paste: ui.action("paste", () => this.pasteLayerOption()),
+            clear: ui.action("clear", () => this.clearLayerOption()),
+            randomise: ui.action("randomise", () => this.randomise()),
+
+            export_: ui.action("export", () => this.exportProject()),
+            import_: ui.action("import", () => this.importProject()),
+            reset: ui.action("reset", () => this.resetProject()),
+            help: ui.action("help", () => this.toggleHelp()),
+
+            exportImage: ui.action("export-image", () => this.exportImage()),
+
+            importPalette: ui.action("import-palette", () => this.importPalette()),
+        };
+
+        // can't undo/redo/paste yet
+        this.actions.undo.disabled = true;
+        this.actions.redo.disabled = true;
+        this.actions.paste.disabled = true;
+
+        // hotkeys
+        document.addEventListener("keydown", (event) => {
+            if (event.ctrlKey && event.key === "z") this.actions.undo.invoke();
+            if (event.ctrlKey && event.key === "y") this.actions.redo.invoke();
+            if (event.ctrlKey && event.key === "c") this.actions.copy.invoke();
+            if (event.ctrlKey && event.key === "v") this.actions.paste.invoke();
+            if (event.ctrlKey && event.key === "x") {
+                this.actions.copy.invoke();
+                this.actions.clear.invoke();
+            }
+
+            if (event.code === "KeyQ") this.toolSelect.selectedIndex = 0;
+            if (event.code === "KeyW") this.toolSelect.selectedIndex = 1;
+            if (event.code === "KeyE") this.toolSelect.selectedIndex = 2;
+            if (event.code === "KeyR") this.toolSelect.selectedIndex = 3;
+
+            if (event.code === "KeyA") this.brushSelect.selectedIndex = 0;
+            if (event.code === "KeyS") this.brushSelect.selectedIndex = 1;
+            if (event.code === "KeyD") this.brushSelect.selectedIndex = 2;
+            if (event.code === "KeyF") this.brushSelect.selectedIndex = 3;
+
+            this.heldColorPick = event.altKey;
+        });
+
+        document.addEventListener("keyup", (event) => {
+            this.heldColorPick = event.altKey;
+        });
+
+        // changes in layer select bar
+        this.layerSelect.addEventListener("change", () => {
+            this.refreshLayerDisplay();
+        });
+
+        this.optionSelect.addEventListener("change", () => {
+            // remember selected option for this layer
+            this.selectedOptions[this.layerSelect.selectedIndex] = this.optionSelect.selectedIndex;
+            this.refreshLayerDisplay();
+        });
+
+        // changes in palette select bar
+        this.paletteSelect.addEventListener("change", async () => {
+            const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+            const option = layer.options[this.optionSelect.selectedIndex];
+            
+            const prev = this.stateManager.present.palettes[option.palette];
+            const next = this.stateManager.present.palettes[this.paletteSelect.selectedIndex];
+            
+            this.stateManager.makeCheckpoint();
+            const instance = await this.forkLayerOptionImage(option);
+            swapPalette(instance, prev, next);
+            option.palette = this.paletteSelect.selectedIndex;
+            this.stateManager.changed();
+
+            this.refreshColorSelect();
+        });
+
+        // changes in stack layers toggle
+        this.stackLayers.addEventListener("change", () => {
+            this.render();
+        });
+
+        // changes in the brush and pattern select bars
+        this.brushSelect.addEventListener("change", () => this.refreshActiveBrush());
+
+        // changes in the color select
+        this.colorSelect.addEventListener("change", () => {
+            this.refreshActiveBrush();
+        });
+    
+        // whenever the project data is changed
+        this.stateManager.addEventListener("change", () => {
+            this.refreshPaletteThumbs();
+            this.refreshLayerThumbnails();
+            this.refreshLayerDisplay();
+    
+            // enable/disable undo/redo buttons
+            this.actions.undo.disabled = !this.stateManager.canUndo;
+            this.actions.redo.disabled = !this.stateManager.canRedo;
+        });
+
+        // whenever a pointer moves anywhere on screen, update the paint cursors
+        // --listen on the whole document because for e.g line drawing it is 
+        // valid to move the mouse outside the edges of the drawing area
+        document.addEventListener("pointermove", (event) => {
+            const { x, y } = mouseEventToCanvasPixelCoords(this.rendering.canvas, event);
+            this.refreshPreview(x, y);
+        });
+        
+        // finger or mouse presses on the drawing area--could begin a drag or
+        // end quickly in a click
+        this.rendering.canvas.addEventListener("pointerdown", async (event) => {
+            // for mouse ignore non-left-clicks
+            if (event.button !== 0) return;
+            // ignore in player mode
+            if (!this.editorMode) return;
+
+            // treat this as the beginning of a possible drag
+            const drag = ui.drag(event);
+            const { x, y } = mouseEventToCanvasPixelCoords(this.rendering.canvas, event);
+
+            // prepare the plot function
+            const mask = createRendering2D(crewmaker.layerWidth, crewmaker.layerHeight);
+            const plotMask = (x, y) => mask.drawImage(this.activeBrush.canvas, (x - 7) | 0, (y - 7) | 0);
+            //const pattern = mask.createPattern(this.activePattern.canvas, 'repeat');
+            const drawPatternedMask = (instance) => {
+                //mask.globalCompositeOperation = "source-in";
+                //fillRendering2D(mask, pattern);
+                //mask.globalCompositeOperation = "source-over";
+
+                const erase = this.colorSelect.selectedIndex === 0;
+                instance.globalCompositeOperation = erase ? "destination-out" : "source-over";
+                instance.drawImage(mask.canvas, 0, 0);
+                instance.globalCompositeOperation = "source-over";
+                this.stateManager.changed();
+            };
+
+            // color picker selected or color pick hotkey held
+            if (this.toolSelect.value === "pick" || this.heldColorPick) {
+                drag.addEventListener("click", () => this.pickColor(x, y));
+            // flood fill selected
+            } else if (this.toolSelect.value === "fill") {
+                drag.addEventListener("click", () => this.floodFill(x, y));
+            // freehand drawing selected
+            } else if (this.toolSelect.value === "freehand") {
+                // fork the current options's image for editing and make an 
+                // undo/redo checkpoint
+                const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+                const option = layer.options[this.optionSelect.selectedIndex];
+                this.stateManager.makeCheckpoint();
+                const instance = await this.forkLayerOptionImage(option);
+
+                // draw the brush at the position the drag begins
+                plotMask(x, y);
+                drawPatternedMask(instance);
+
+                let prev = { x, y };
+
+                // draw the brush at the last position of the drag
+                drag.addEventListener("up", (event) => {
+                    const { x, y } = mouseEventToCanvasPixelCoords(this.rendering.canvas, event.detail);
+                    plotMask(x, y);
+                    drawPatternedMask(instance);
+                });
+
+                // as the pointer moves, draw brush lines between the points
+                drag.addEventListener("move", (event) => {
+                    const { x: x0, y: y0 } = prev;
+                    const { x: x1, y: y1 } = mouseEventToCanvasPixelCoords(this.rendering.canvas, event.detail);
+                    lineplot(x0, y0, x1, y1, plotMask);
+                    drawPatternedMask(instance);
+                    prev = { x: x1, y: y1 };
+                });
+            // line drawing selected
+            } else if (this.toolSelect.value === "line") {
+                // need to save this to draw the line preview
+                this.lineStart = { x, y };
+                this.refreshPreview(x, y);
+
+                // only actually draw the line at the end
+                drag.addEventListener("up", async (event) => {
+                    // fork the current options's image for editing and make an 
+                    // undo/redo checkpoint
+                    const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+                    const option = layer.options[this.optionSelect.selectedIndex];
+                    this.stateManager.makeCheckpoint();
+                    const instance = await this.forkLayerOptionImage(option);
+                    
+                    // line from pointer down position to pointer up position
+                    const { x: x0, y: y0 } = this.lineStart;
+                    const { x: x1, y: y1 } = mouseEventToCanvasPixelCoords(this.rendering.canvas, event.detail);
+
+                    lineplot(x0, y0, x1, y1, plotMask);
+                    drawPatternedMask(instance);
+
+                    // stop tracking line drawing
+                    this.lineStart = undefined;
+                });
+            }  else if (this.toolSelect.value === "shift") {
+                this.shiftStart = { x, y };
+
+                drag.addEventListener("up", async (event) => {
+                    const { x: x0, y: y0 } = this.shiftStart;
+                    const { x: x1, y: y1 } = mouseEventToCanvasPixelCoords(this.rendering.canvas, event.detail);
+
+                    fillRendering2D(this.preview);
+                    this.preview.drawImage(this.stackActive.canvas, x1 - x0, y1 - y0);
+
+                    // fork the current options's image for editing and make an 
+                    // undo/redo checkpoint
+                    const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+                    const option = layer.options[this.optionSelect.selectedIndex];
+                    this.stateManager.makeCheckpoint();
+                    const instance = await this.forkLayerOptionImage(option);
+                    fillRendering2D(instance);
+                    instance.drawImage(this.preview.canvas, 0, 0);
+                    
+                    this.shiftStart = undefined;
+                    this.refreshPreview(x1, y1);
+                });
+            }
+        });
+    }
+
+    async init() {
+        // load all the brush images
+        this.brushRenders = await Promise.all(crewmaker.brushes.map(({ image }) => loadImage(image).then(imageToRendering2D)));
+        
+        // make brush and pattern valid
+        this.refreshActiveBrush();
+    }
+
+    /**
+     * @param {CrewmakerDataLayerOption} option 
+     * @returns {Promise<CanvasRenderingContext2D>}
+     */
+    async forkLayerOptionImage(option) {
+        // create a new copy of the image resource
+        const { id, instance } = await this.stateManager.resources.fork(option.image);
+        // replace the option's image with the new copy
+        option.image = id;
+        // return the instance of the image for editing
+        return instance;
+    }
+
+    render() {
+        // clear everything
+        fillRendering2D(this.stackActive);
+        fillRendering2D(this.stackUnder);
+        fillRendering2D(this.stackOver);
+        fillRendering2D(this.rendering);
+
+        // composite layers into below, current, above
+        this.stateManager.present.layers.forEach((layer, index) => {
+            // get the layer's current option scene's image
+            const option = layer.options[this.selectedOptions[index]];
+            const image = this.stateManager.resources.get(option.image);
+            
+            if (index < this.layerSelect.selectedIndex) this.stackUnder.drawImage(image.canvas, 0, 0);
+            if (index > this.layerSelect.selectedIndex) this.stackOver.drawImage(image.canvas, 0, 0);
+            if (index === this.layerSelect.selectedIndex) this.stackActive.drawImage(image.canvas, 0, 0);
+        });
+
+        // should other layers be drawn transparent?
+        const onion = this.editorMode && !this.stackLayers.checked;
+        const inactiveAlpha = onion ? .35 : 1;
+
+        // all layers below the active layer
+        this.rendering.globalAlpha = inactiveAlpha;
+        this.rendering.drawImage(this.stackUnder.canvas, 0, 0);
+        // the active layer + paint preview
+        this.rendering.globalAlpha = 1;
+        this.rendering.drawImage(this.stackActive.canvas, 0, 0);
+        this.rendering.drawImage(this.preview.canvas, 0, 0);
+        // all layers above the active layer
+        this.rendering.globalAlpha = inactiveAlpha;
+        this.rendering.drawImage(this.stackOver.canvas, 0, 0);
+        this.rendering.globalAlpha = 1;
+
+        // signal, to anyone listening, that rendering happened
+        this.dispatchEvent(new CustomEvent("render"));
+    }
+
+    refreshPreview(x, y) {
+        if (!this.activeBrush) return;
+
+        // clear existing preview
+        fillRendering2D(this.preview);
+
+        // prepare plot function
+        const plot = (x, y) => this.preview.drawImage(this.activeBrush.canvas, (x - 7) | 0, (y - 7) | 0);
+
+        const cursor = this.toolSelect.value === "shift" ? "move" : "crosshair";
+        this.rendering.canvas.style.setProperty("cursor", cursor);
+
+        if (this.shiftStart) {
+            const { x: ox, y: oy } = this.shiftStart;
+            this.preview.drawImage(this.stackActive.canvas, x - ox, y - oy);
+        } else if (this.heldColorPick) {
+            // no preview for color picking
+        } else if (this.lineStart) {
+            // draw a patterned line between the pointer down location and the
+            // current pointer location
+            const { x: x0, y: y0 } = this.lineStart;
+            lineplot(x0, y0, x, y, plot);
+            //this.preview.globalCompositeOperation = "source-in";
+            //fillRendering2D(this.preview, this.preview.createPattern(this.activePattern.canvas, 'repeat'));
+            //this.preview.globalCompositeOperation = "source-over";
+        } else if (this.toolSelect.value === "freehand" || this.toolSelect.value === "line") {
+            // draw the patterned brush at the current pointer location
+            plot(x, y);
+            //this.preview.globalCompositeOperation = "source-in";
+            //fillRendering2D(this.preview, this.preview.createPattern(this.activePattern.canvas, 'repeat'));
+            //this.preview.globalCompositeOperation = "source-over";
+        } 
+
+        this.render();
+    }
+
+    refreshLayerDisplay() {
+        this.actions.layerUp.disabled = this.layerSelect.selectedIndex < 1;
+        this.actions.layerDown.disabled = this.layerSelect.selectedIndex > 6;
+
+        // switch option to remembered option for this layer
+        this.optionSelect.selectedIndex = this.selectedOptions[this.layerSelect.selectedIndex];
+
+        // switch to the natural palette of this option
+        const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+        const option = layer.options[this.optionSelect.selectedIndex];
+        this.paletteSelect.selectedIndex = option.palette;
+
+        this.refreshLayerOptionThumbnails();
+        this.refreshColorSelect();
+        this.refreshActiveBrush();
+
+        this.render();
+    }
+
+    refreshActiveBrush() {
+        if (!this.stateManager.present) return;
+
+        //const pattern = this.patternRenders[this.patternSelect.selectedIndex];
+        const brush = this.brushRenders[this.brushSelect.selectedIndex];
+        const palette = this.stateManager.present.palettes[this.paletteSelect.selectedIndex];
+        const color = palette[this.colorSelect.selectedIndex];
+        //if (!pattern || !brush || !color) return;
+        this.activeBrush = this.colorSelect.selectedIndex > 0 ? recolorMask(brush, color) : brush;
+        //this.activePattern = recolorMask(pattern, color);
+    }
+
+    refreshPaletteThumbs() {
+        // generate palette thumbnails
+        this.paletteThumbs.forEach((thumbnail, index) => {
+            const gap = 0;
+            const size = 12;
+            const pad = 0;
+
+            resizeRendering2D(thumbnail, 4 * size + 3 * gap + pad * 2, 2 * size + 1 * gap + pad * 2);
+            const palette = this.stateManager.present.palettes[index];
+            for (let y = 0; y < 2; ++y) {
+                for (let x = 0; x < 4; ++x) {
+                    thumbnail.fillStyle = palette[y * 4 + x];
+                    thumbnail.fillRect(x * (size + gap) + pad, y * (size + gap) + pad, size, size);
+                }
+            }
+        });
+    }
+
+    refreshColorSelect() {
+        const palette = this.stateManager.present.palettes[this.paletteSelect.selectedIndex];
+
+        // recolor the color select buttons to the corresponding color
+        ALL("#color-select label").forEach((label, index) => {
+            label.style.background = index > 0 ? palette[index] : "var(--trans-gradient)";
+        });
+    }
+
+    refreshLayerThumbnails() {
+        this.layerThumbs.forEach((thumbnail, index) => {
+            const layer = this.stateManager.present.layers[index];
+
+            fillRendering2D(thumbnail);
+
+            layer.options.forEach((layer) => {
+                const image = this.stateManager.resources.get(layer.image);
+                thumbnail.drawImage(image.canvas, 0, 0);
+            });
+
+            thumbnail.globalCompositeOperation = "source-in";
+            fillRendering2D(thumbnail, "#ffffff");
+            thumbnail.globalCompositeOperation = "source-over";
+        });
+    }
+
+    refreshLayerOptionThumbnails() {
+        const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+        this.optionThumbs.forEach((thumbnail, index) => {
+            fillRendering2D(thumbnail);
+            const image = this.stateManager.resources.get(layer.options[index].image);
+            thumbnail.drawImage(image.canvas, 0, 0);
+
+            thumbnail.globalCompositeOperation = "source-in";
+            fillRendering2D(thumbnail, "#ffffff");
+            thumbnail.globalCompositeOperation = "source-over";
+        });
+    }
+
+    floodFill(x, y) {
+        this.stateManager.makeChange(async (data) => {
+            // fork the current options's image
+            const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+            const option = layer.options[this.optionSelect.selectedIndex];
+            const instance = await this.forkLayerOptionImage(option);
+
+            const palette = this.stateManager.present.palettes[this.paletteSelect.selectedIndex];
+            const color = palette[this.colorSelect.selectedIndex];
+            const uint32 = this.colorSelect.selectedIndex > 0 ? hexToUint32(color) : 0;
+            floodfill(instance, x, y, uint32);
+
+            // find newly filled pixels
+            // const mask = floodfillOutput(instance, x, y, 0xFFFFFFFF);
+            // pattern the filled pixels
+            // mask.globalCompositeOperation = "source-in";
+            // fillRendering2D(mask, mask.createPattern(this.activePattern.canvas, 'repeat'));
+            // draw the final patterned fill
+            // instance.drawImage(mask.canvas, 0, 0);
+        });
+    }
+
+    pickColor(x, y) {
+        const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+        const option = layer.options[this.optionSelect.selectedIndex];
+        const instance = this.stateManager.resources.get(option.image);
+
+        const [r, g, b, a] = instance.getImageData(x, y, 1, 1).data;
+        const hex = rgbToHex({ r, g, b});
+        const palette = this.stateManager.present.palettes[option.palette];
+        
+        this.colorSelect.selectedIndex = a === 0 
+                                       ? 0
+                                       : palette.findIndex((color) => color === hex);
+    }
+
+    shiftLayerUp() {
+        if (this.layerSelect.selectedIndex < 1) return;
+
+        this.stateManager.makeChange(async (data) => {
+            const i = this.layerSelect.selectedIndex;
+            [data.layers[i-1], data.layers[i]] = [data.layers[i], data.layers[i-1]];
+            [this.selectedOptions[i-1], this.selectedOptions[i]] = [this.selectedOptions[i], this.selectedOptions[i-1]]
+            this.layerSelect.selectedIndex -= 1;
+            this.refreshLayerDisplay();
+        });
+    }
+
+    shiftLayerDown() {
+        if (this.layerSelect.selectedIndex > 6) return;
+
+        this.stateManager.makeChange(async (data) => {
+            const i = this.layerSelect.selectedIndex;
+            [data.layers[i], data.layers[i+1]] = [data.layers[i+1], data.layers[i]];
+            [this.selectedOptions[i], this.selectedOptions[i+1]] = [this.selectedOptions[i+1], this.selectedOptions[i]]
+            this.layerSelect.selectedIndex += 1;
+            this.refreshLayerDisplay();
+        });
+    }
+
+    copyLayerOption() {
+        // make a copy of option data and enable pasting
+        const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+        this.copiedLayerOption = COPY(layer.options[this.optionSelect.selectedIndex]);
+        this.actions.paste.disabled = false;
+    }
+
+    pasteLayerOption() {
+        this.stateManager.makeChange(async (data) => {
+            // replace selected layer option with a copy of the copied option
+            // --this is so it remains independent from the option kept in the
+            // clipboard
+            const layer = data.layers[this.layerSelect.selectedIndex];
+            layer.options[this.optionSelect.selectedIndex] = COPY(this.copiedLayerOption);
+        });
+    }
+
+    clearLayerOption() {
+        this.stateManager.makeChange(async (data) => {
+            const layer = data.layers[this.layerSelect.selectedIndex];
+            const option = layer.options[this.optionSelect.selectedIndex];
+            const instance = await this.forkLayerOptionImage(option);
+            fillRendering2D(instance);
+        });
+    }
+
+    async randomise() {
+        this.selectedOptions = ZEROES(8).map(() => getRandomInt(0, 8));
+        await this.stateManager.makeChange(async (data) => {
+            await Promise.all(data.layers.map(async (layer, index) => {
+                const option = layer.options[this.selectedOptions[index]];
+                const instance = await this.forkLayerOptionImage(option);
+
+                const prev = data.palettes[option.palette];
+                option.palette = getRandomInt(0, 8);
+                const next = data.palettes[option.palette];
+
+                swapPalette(instance, prev, next);
+            }));
+        });
+        this.refreshLayerDisplay();
+    }
+
+    /** @returns {string[]} */
+    getManifest() {
+        // the editor adds a dependency to the image in the copied scene, if any
+        // --we don't want this resource to be cleaned up accidentally because
+        // we might still want to paste it even after it stops being used in
+        // other scenes
+        return this.copiedLayerOption ? [this.copiedLayerOption.image] : [];
+    }
+
+    async exportProject() {
+        // make a standalone bundle of the current project state and the 
+        // resources it depends upon
+        const bundle = await this.stateManager.makeBundle();
+
+        // make a copy of this web page
+        const clone = /** @type {HTMLElement} */ (document.documentElement.cloneNode(true));
+        // remove some unwanted elements from the page copy
+        ALL("[data-empty]", clone).forEach((element) => element.replaceChildren());
+        ALL("[data-editor-only]", clone).forEach((element) => element.remove());
+        // insert the project bundle data into the page copy 
+        ONE("#bundle-embed", clone).innerHTML = JSON.stringify(bundle);
+
+        // prompt the browser to download the page
+        const name = "flickguy.html";
+        const blob = maker.textToBlob(clone.outerHTML, "text/html");
+        maker.saveAs(blob, name);
+    }
+
+    async importProject() {
+        // ask the browser to provide a file
+        const [file] = await maker.pickFiles("text/html");
+        // read the file and turn it into an html page
+        const text = await maker.textFromFile(file);
+        const html = await maker.htmlFromText(text);
+        // extract the bundle from the imported page
+        const bundle = maker.bundleFromHTML(html);
+        // load the contents of the bundle into the editor
+        await this.stateManager.loadBundle(bundle);
+    } 
+
+    async resetProject() {
+        // open a blank project in the editor
+        await this.stateManager.loadBundle(crewmaker.makeBlankBundle());
+    }
+    
+    exportImage() {
+        this.rendering.canvas.toBlob((blob) => {
+            maker.saveAs(blob, "your-character.png");
+        });        
+    }
+
+    toggleHelp() {
+        this.helpContainer.hidden = !this.helpContainer.hidden;
+    }
+
+    // for debugging
+    async importPalette() {
+        const [file] = await maker.pickFiles("image/*");
+        const dataUri = await maker.dataURIFromFile(file);
+        const image = await loadImage(dataUri);
+        const rendering = imageToRendering2D(image);
+
+        const prevPalettes = this.stateManager.present.palettes;
+        const nextPalettes = ZEROES(8).map(() => REPEAT(8, "#000000"));
+        withPixels(rendering, (pixels) => {
+            for (let p = 0; p < 8; ++p) {
+                for (let i = 1; i < 8; ++i) {
+                    nextPalettes[p][i] = rgbToHex(uint32ToRGB(pixels[p * 8 + i]));
+                }
+            }
+        });
+
+        await this.stateManager.makeChange(async (data) => {
+            data.palettes = nextPalettes;
+            const promises = data.layers.flatMap((layer) => { 
+                return layer.options.map(async (option) => {
+                    const instance = await this.forkLayerOptionImage(option);
+                    swapPalette(instance, prevPalettes[option.palette], nextPalettes[option.palette]);
+                });
+            });
+
+            return Promise.all(promises);
+        });
+    }
+
+    enterPlayerMode() {
+        this.editorMode = false;
+        ALL("[data-hidden-in-editor]").forEach((element) => element.hidden = false);
+        ALL("[data-hidden-in-player]").forEach((element) => element.hidden = true);
+        this.rendering.canvas.style.setProperty("cursor", "unset");
+        this.render();
+    }
+
+    enterEditorMode() {
+        this.editorMode = true;
+        ALL("[data-hidden-in-editor]").forEach((element) => element.hidden = true);
+        ALL("[data-hidden-in-player]").forEach((element) => element.hidden = false);
+        this.rendering.canvas.style.setProperty("cursor", "crosshair");
+        this.render();
+    }
+}
+
+crewmaker.start = async function () {
+    const editor = new crewmaker.Editor();
+    await editor.init();
+
+    // setup play/edit buttons to switch between modes
+    const play = ui.action("play", () => editor.enterPlayerMode());
+    const edit = ui.action("edit", () => editor.enterEditorMode());
+
+    // determine if there is a project bundle embedded in this page
+    const bundle = maker.bundleFromHTML(document);
+
+    if (bundle) {
+        // embedded project, load it in the player
+        await editor.stateManager.loadBundle(bundle);
+        editor.enterPlayerMode();
+    } else {
+        // no embedded project, start editor with default
+        const bundle = maker.bundleFromHTML(document, "#editor-embed");
+        await editor.stateManager.loadBundle(bundle);
+        //await editor.resetProject();
+        editor.enterEditorMode();
+    }
+}
+
+    </script>
+    <!-- styles-->
+    <style id="base-style">
+/* prevent weird highlights https://stackoverflow.com/questions/21003535/ */
+.no-select {
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    -khtml-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+}
+
+/* hidden elements should be hidden regardless of their display style */
+[hidden] { display: none !important; }
+
+/* default to width/height including padding and border */
+* { box-sizing: border-box; }
+
+/* used dynamically to prevent or cancel smooth transitions */
+.skip-transition { transition: none !important; }
+
+/* make buttons and select inherit font */ 
+button, select { font-family: inherit; font-size: inherit; }
+
+/* clickable things should use this cursor imo */
+button, a, input[type="radio"],  input[type="checkbox"], select, option, label { cursor: pointer; }
+
+/* crisp pixelart */
+canvas, img {
+    image-rendering: -moz-crisp-edges;
+    image-rendering: -webkit-crisp-edges;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+}
+
+    </style>
+    <style id="main-style">:root {
+    --button-color: #ffd800;
+
+    --trans-color-1: rgb(32, 32, 32);
+    --trans-color-2: rgb(48, 48, 48);
+    --trans-gradient: repeating-linear-gradient( -45deg, var(--trans-color-1), var(--trans-color-1) .5em, var(--trans-color-2) .5em, var(--trans-color-2) 1em );
+
+    font-family: sans-serif;
+}
+
+html, body {
+    margin: 0; padding: 0;
+    width: 100vw; min-height: 100vh;
+}
+
+body {
+    display: flex; flex-direction: column;
+    justify-content: center;
+    align-items: center;
+
+    background: black;
+}
+
+#player {
+    position: absolute;
+    width: 100%; height: 100%;
+    overflow: hidden;
+
+    display: flex;
+    flex-direction: column;
+
+    padding: 1em;
+    padding-bottom: 0;
+    gap: 1em;
+}
+
+#player-container {
+    flex: 1;
+
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+#player-menu {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 1fr;
+    gap: 1em;
+
+    height: 32px;
+
+    align-self: center;
+}
+
+#player-menu button {
+    background-color: black;
+    color: white;
+
+    font-weight: bold;
+    padding-left: 1em;
+    padding-right: 1em;
+
+    border: 1px solid white;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+    border-bottom: none;
+}
+
+#player-menu a {
+    background-color: black;
+    color: white;
+
+    font-weight: bold;
+    padding-left: 1em;
+    padding-right: 1em;
+
+    display: flex;
+    justify-content: center;
+    align-items: center;
+
+    border: 1px solid white;
+    border-radius: 1em;
+}
+
+#editor {
+    display: flex; flex-direction: column;
+    justify-content: center;
+    align-items: center;
+}
+
+#editor main {
+    display: flex;
+    flex-direction: column;
+
+    padding: 1em;
+    background: #367b6b;
+    border-radius: 2em;
+    gap: 1em;
+}
+
+h1, h2, h3, h4, h5, h6 {
+    margin: 0;
+}
+
+#help {
+    font-family: monospace;
+    font-size: large;
+
+    display: flex;
+    padding: 1em;
+    gap: 1em;
+
+    overflow: hidden scroll;
+}
+
+#help [name="help"] {
+    position: absolute;
+    top: 1em; right: 1em;
+}
+
+#help button {
+    padding: 0 1em;
+    height: 32px;
+}
+
+#help p {
+    margin: 0;
+}
+
+#help a {
+    color: var(--button-color);
+}
+
+#help a:hover {
+    color: white;
+}
+
+#help a:visited {
+    color: gray;
+}
+
+#help ul {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    margin: 0 1em;
+    padding: 0;
+    gap: .5em 1em;
+    list-style: none;
+
+    align-content: center;
+}
+
+#menu {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 1fr;
+    gap: 1em;
+
+    height: 32px;
+}
+
+#menu button {
+    background-color: var(--button-color);
+
+    font-weight: bold;
+    padding-left: 1em;
+    padding-right: 1em;
+
+    border: none;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+}
+
+fieldset {
+    border: 0;
+    margin: 0;
+    padding: 0;
+}
+
+#scene-select {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    /* gap: .5em; */
+    gap: 2px;
+}
+
+#scene-select label {
+    aspect-ratio: 160 / 100;
+    background: none;
+}
+
+#scene-select *:checked + :not(input) {
+    box-shadow: 0 0 0 .5em white;
+    z-index: 5;
+}
+
+#scene-select label :not(input) {
+    filter: none;
+}
+
+#scene-select label :not(input) {
+    width: 100%; height: 100%;
+    position: absolute;
+}
+
+.grid8 label :not(input) { border-radius: 0; }
+.grid8 label:nth-child(1) :not(input) { border-top-left-radius: 1em; }
+.grid8 label:nth-child(8) :not(input) { border-top-right-radius: 1em; }
+.grid8 label:nth-last-child(8) :not(input) { border-bottom-left-radius: 1em; }
+.grid8 label:nth-last-child(1) :not(input) { border-bottom-right-radius: 1em; }
+
+#tools {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    grid-template-rows: repeat(5, 1fr);
+    gap: 1em;
+}
+
+#tool-select {
+    grid-column: 1 / span 4;
+    grid-row: 1;
+
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+}
+
+#tool-select input[type="radio"]:checked + img {
+    filter: invert();
+}
+
+#brush-select {
+    grid-column: 1 / span 4;
+    grid-row: 2 / span 1;
+
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    grid-template-rows: repeat(auto, 1fr);
+}
+
+#pattern-select {
+    grid-column: 1 / span 4;
+    grid-row: span 2;
+}
+
+#color-select {
+    grid-column: 5 / span 4;
+    grid-row: 1 / span 4;
+}
+
+#color-select input[type="radio"]:checked {
+    background: none;
+    box-shadow: 0 0 0 var(--highlight-thickness) white;
+    z-index: 5;
+
+    animation-name: selection-flash;
+    animation-direction: alternate;
+    animation-duration: 2s;
+    animation-iteration-count: infinite;
+}
+
+#jump-bar {
+    grid-column: 6 / -1;
+
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+
+    overflow: hidden;
+}
+
+#jump-source-color {
+    grid-column: 1 / span 1;
+
+    background-color: #d27d2c;
+}
+
+#jump-source-color {
+    text-align: center;
+    padding: .5em;
+
+    border-top-left-radius: 1em;
+    border-bottom-left-radius: 1em;
+}
+
+#jump-source-color svg {
+    pointer-events: none;
+    width: 24px;
+    height: 24px;
+}
+
+#jump-destination-select {
+    grid-column: 2 / -1;
+
+    padding: .5em;
+
+    border: none;
+    border-top-right-radius: 1em;
+    border-bottom-right-radius: 1em;
+
+    background-color: var(--button-color);
+}
+
+#toolbar {
+    grid-column: 1 / span 5;
+}
+
+#viewport {
+    position: relative;
+    display: flex; flex-direction: column;
+    border-radius: 1em;
+
+    background: var(--trans-gradient);
+    padding: .65em;
+
+    justify-content: center;
+    align-items: center;
+
+    overflow: hidden;
+}
+
+#help {
+    position: absolute;
+    left: 0; top: 0;
+    width: 100%; height: 100%;
+    color: white;
+    background-color: #000000DD;
+    /* border-radius: 1em; */
+
+    display: flex;
+    flex-direction: column;
+    padding: 1em;
+    overflow: auto;
+}
+
+#renderer {
+    width: 640px;
+    height: 400px;
+    background: magenta;
+
+    touch-action: none;
+}
+
+.button-row {
+    display: flex;
+    flex-direction: row;
+    gap: 1em;
+}
+
+button {
+    flex: 1;
+    white-space: nowrap;
+
+    border: none;
+    border-radius: 1em;
+    background-color: var(--button-color);
+
+    font-weight: bold;
+
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+button:active {
+    filter: invert();
+}
+
+button:disabled {
+    opacity: .5;
+    cursor: not-allowed;
+}
+
+.grid4 {
+    display: grid;
+    grid-template-columns: repeat(4, auto);
+}
+
+.grid4 label { border-radius: 0; }
+.grid4 label:nth-child(1) { border-top-left-radius: 1em; }
+.grid4 label:nth-child(4) { border-top-right-radius: 1em; }
+.grid4 label:nth-last-child(4) { border-bottom-left-radius: 1em; }
+.grid4 label:nth-last-child(1) { border-bottom-right-radius: 1em; }
+
+.grid8 label { border-radius: 0; }
+.grid8 label:nth-child(1) { border-top-left-radius: 1em; }
+.grid8 label:nth-child(8) { border-top-right-radius: 1em; }
+.grid8 label:nth-last-child(8) { border-bottom-left-radius: 1em; }
+.grid8 label:nth-last-child(1) { border-bottom-right-radius: 1em; }
+
+.grid6 {
+    display: grid;
+    grid-template-columns: repeat(6, auto);
+}
+
+.grid8 {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+}
+
+.radio-select {
+    --highlight-thickness: .5em;
+}
+
+.radio-select label {
+    position: relative;
+
+    margin: 0;
+    appearance: unset;
+    background-color: var(--button-color);
+}
+
+.radio-select input[type="radio"] {
+    margin: 0;
+    appearance: unset;
+    border-radius: inherit;
+
+    position: absolute;
+    width: 100%; height: 100%;
+}
+
+.radio-select label img, .radio-select label svg, button img, button svg {
+    pointer-events: none;
+    width: 32px; height: 32px;
+}
+
+.radio-select label img, .radio-select label svg {
+    position: absolute;
+    left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+}
+
+.radio-select input[type="radio"]:checked {
+    border: none;
+    background: blue;
+}
+
+.radio-select img {
+    filter: brightness(0);
+}
+
+.radio-select svg {
+    color: black;
+}
+
+.radio-select input[type="radio"]:checked + svg {
+    color: white;
+}
+
+.radio-select input[type="radio"]:checked + img {
+    filter: none;
+}
+
+@keyframes selection-flash {
+    0% {
+        box-shadow: 0 0 0 var(--highlight-thickness) black;
+    }
+
+    100% {
+        box-shadow: 0 0 0 var(--highlight-thickness) white;
+    }
+}
+
+.horizontal-capsule {
+    display: flex;
+    flex-direction: row;
+}
+
+.horizontal-capsule * {
+    flex: 1;
+}
+
+.horizontal-capsule > :first-child {
+    border-radius: 1em 0 0 1em;
+}
+
+.horizontal-capsule > :last-child {
+    border-radius: 0 1em 1em 0;
+}
+
+.vertical-capsule {
+    display: flex;
+    flex-direction: column;
+}
+
+.vertical-capsule * {
+    flex: 1;
+}
+
+.vertical-capsule > :first-child, .vertical-capsule > :first-child[hidden] + * {
+    border-radius: 1em 1em 0 0;
+}
+
+.vertical-capsule > :last-child, .vertical-capsule > :first-child[hidden] ~ :nth-last-child(2) {
+    border-radius: 0 0 1em 1em;
+}
+
+    </style>
+    <style id="crewmaker-style">.radio-select label {
+    min-height: 3em;
+}
+
+#viewport {
+    padding: 0;
+}
+
+#renderer {
+    width: 512px;
+    height: 512px;
+
+    background: none;
+}
+
+#stack-layers {
+    position: absolute;
+    top: 1em; right: 1em;
+    width: 60px;
+    height: 48px;
+
+    margin: 0;
+    appearance: unset;
+    background-color: var(--button-color);
+
+    border-radius: 1em;
+
+    opacity: 50%;
+}
+
+#stack-layers input {
+    appearance: unset;
+    margin: 0;
+    appearance: unset;
+    border-radius: inherit;
+
+    position: absolute;
+    width: 100%; height: 100%;
+}
+
+#stack-layers input + svg {
+    color: black;
+
+    pointer-events: none;
+    width: 32px; height: 32px;
+
+    position: absolute;
+    left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+}
+
+#stack-layers input:checked {
+    background: blue;
+}
+
+#stack-layers input:checked + svg {
+    color: white;
+}
+
+#layer-select {
+    gap: 2px;
+}
+
+#layer-select label {
+    background-color: var(--button-color);
+}
+
+#layer-select *:checked + :not(input) {
+    background: blue;
+}
+
+#layer-select label :not(input) {
+    filter: invert();
+}
+
+#layer-select label *:checked + :not(input) {
+    filter: none;
+}
+
+#layer-select label :not(input) {
+    width: 100%; height: 100%;
+    position: absolute;
+    border-radius: inherit;
+}
+
+#option-select label :not(input) {
+    width: 100%; height: 100%;
+    position: absolute;
+    border-radius: inherit;
+    object-fit: contain;
+
+    image-rendering: auto;
+}
+
+#option-select *:checked + :not(input) {
+    background: blue;
+}
+
+#option-select label :not(input) {
+    filter: brightness(0);
+}
+
+#option-select label *:checked + :not(input) {
+    filter: none;
+}
+
+#palette-select label :not(input) {
+    position: absolute;
+    border-radius: none;
+
+    position: absolute;
+    left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+}
+
+#middle {
+    display: flex;
+    flex-direction: row;
+    gap: 1em;
+}
+
+#layer-options {
+    display: flex;
+    flex-direction: row;
+    gap: 1em;
+    align-items: stretch;
+}
+
+#option-select {
+    flex: 1;
+    gap: 2px;
+}
+
+#palette-select {
+    flex: 1;
+}
+
+#palette-select input[type="radio"]:checked {
+    background: blue;
+}
+
+#layer-select label {
+    width: 64px;
+}
+
+#toolbar button {
+    padding: .25em;
+}
+
+#tools {
+    grid-template-areas:
+        "tool   color"
+        "brush  color"
+        "bar    bar  ";
+
+    grid-template-rows: unset;
+    grid-template-columns: unset;
+}
+
+#tool-select {
+    grid-area: tool;
+
+    display: flex;
+    flex-direction: row;
+}
+
+#brush-select {
+    grid-area: brush;
+}
+
+#color-select {
+    grid-area: color;
+}
+
+#toolbar {
+    grid-area: bar;
+}
+
+.hanging-menu {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 1fr;
+    gap: 1em;
+
+    height: 32px;
+}
+
+.hanging-menu button {
+    background-color: var(--button-color);
+
+    font-weight: bold;
+    padding-left: 1em;
+    padding-right: 1em;
+
+    border: none;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+}
+
+#layer-select > :nth-child(2) {
+    border-radius: 1em 1em 0 0;
+}
+
+#layer-select > :nth-last-child(2) {
+    border-radius: 0 0 1em 1em;
+}
+
+#layer-select > button {
+    border-radius: 1em;
+}
+
+#layer-select > :first-child {
+    margin-bottom: 1em;
+}
+
+#layer-select > :last-child {
+    margin-top: 1em;
+}
+
+:focus {
+    outline: thick solid white;
+    z-index: 5;
+}
+:focus:not(:focus-visible) { 
+    outline: unset 
+}
+
+:focus + * {
+    z-index: 5;
+}
+
+    </style>
+  </head>
+  <body onload="crewmaker.start()" class="vsc-initialized">
+    <div id="editor">
+      <main>
+        <section id="middle">
+          <div class="vertical-capsule radio-select" id="layer-select">
+            <button name="layer-up" title="shift layer up" data-hidden-in-player=""><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-layer-forward" viewBox="0 0 16 16"><path d="M8.354.146a.5.5 0 0 0-.708 0l-3 3a.5.5 0 0 0 0 .708l1 1a.5.5 0 0 0 .708 0L7 4.207V12H1a1 1 0 0 0-1 1v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1H9V4.207l.646.647a.5.5 0 0 0 .708 0l1-1a.5.5 0 0 0 0-.708l-3-3z"></path><path d="M1 7a1 1 0 0 0-1 1v2a1 1 0 0 0 1 1h4.5a.5.5 0 0 0 0-1H1V8h4.5a.5.5 0 0 0 0-1H1zm9.5 0a.5.5 0 0 0 0 1H15v2h-4.5a.5.5 0 0 0 0 1H15a1 1 0 0 0 1-1V8a1 1 0 0 0-1-1h-4.5z"></path></svg></button>
+            <label>
+              <input type="radio" name="layer-select" value="0" title="open layer 0"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="layer-select" value="1" title="open layer 1"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="layer-select" value="2" title="open layer 2"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="layer-select" value="3" title="open layer 3"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="layer-select" value="4" title="open layer 4"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="layer-select" value="5" title="open layer 5"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="layer-select" value="6" title="open layer 6"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="layer-select" value="7" title="open layer 7"><canvas width="128" height="128"></canvas>
+            </label>
+            <button name="layer-down" title="shift layer down" data-hidden-in-player=""><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-layer-backward" viewBox="0 0 16 16"><path d="M8.354 15.854a.5.5 0 0 1-.708 0l-3-3a.5.5 0 0 1 0-.708l1-1a.5.5 0 0 1 .708 0l.646.647V4H1a1 1 0 0 1-1-1V1a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1H9v7.793l.646-.647a.5.5 0 0 1 .708 0l1 1a.5.5 0 0 1 0 .708l-3 3z"></path><path d="M1 9a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h4.5a.5.5 0 0 1 0 1H1v2h4.5a.5.5 0 0 1 0 1H1zm9.5 0a.5.5 0 0 1 0-1H15V6h-4.5a.5.5 0 0 1 0-1H15a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1h-4.5z"></path></svg></button>
+          </div>
+          <div id="viewport">
+            <canvas id="renderer" width="128" height="128" draggable="false" style="cursor: crosshair;"></canvas>
+            <label id="stack-layers" data-hidden-in-player="">
+              <input type="checkbox" name="stack-layers" title="show selected options for every layer at once"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-stack" viewBox="0 0 16 16"><path d="m14.12 10.163 1.715.858c.22.11.22.424 0 .534L8.267 15.34a.598.598 0 0 1-.534 0L.165 11.555a.299.299 0 0 1 0-.534l1.716-.858 5.317 2.659c.505.252 1.1.252 1.604 0l5.317-2.66zM7.733.063a.598.598 0 0 1 .534 0l7.568 3.784a.3.3 0 0 1 0 .535L8.267 8.165a.598.598 0 0 1-.534 0L.165 4.382a.299.299 0 0 1 0-.535L7.733.063z"></path><path d="m14.12 6.576 1.715.858c.22.11.22.424 0 .534l-7.568 3.784a.598.598 0 0 1-.534 0L.165 7.968a.299.299 0 0 1 0-.534l1.716-.858 5.317 2.659c.505.252 1.1.252 1.604 0l5.317-2.659z"></path></svg>
+            </label>
+            <div id="help" hidden="">
+              <button name="help" title="hide help">close</button>version 1 (6/15/2021)<h1>flickguy</h1>
+<p>i'm candle and this is my take on a low-effort picrew inspired by stephen lavelle's <a href="http://flickgame.org">flickgame</a> tool</p>
+<p>i made this tool to help iron out a web tool template i'm working on, <a href="https://kool.tools/blog/flickgame-study.html">read more about it on my website</a></p>
+<h2>format</h2>
+<p>a flickguy is a tool for making little guys by compositing layers. each layer
+has a selection of image options and those images can optionally be palette
+swapped for color variations</p>
+<p>this is a tool or creating flickguys by painting 8 image options for 8 layers. the exported flickguy also allows the user to "remix" it to either make bespoke
+adjustments to their guy or make a whole new derivative flickguy to let others use</p>
+<h2>hotkeys</h2>
+<ul>
+<li><strong>ctrl+z</strong>: undo</li>
+<li><strong>ctrl+y</strong>: redo</li>
+<li><strong>ctrl+c</strong>: copy image</li>
+<li><strong>ctrl+v</strong>: paste image</li>
+<li><strong>qwer</strong>: change tool</li>
+<li><strong>asdf</strong>: change brush</li>
+<li><strong>alt+click</strong>: pick color</li>
+</ul>
+<h2>credits</h2>
+<p>thanks to <a href="https://twitter.com/netgal_emi">em</a>, <a href="https://twitter.com/SeanSLeBlanc">sean</a>, <a href="https://twitter.com/jazzmickle">jazz</a> for testing and advice</p>
+<p>palettes sampled from <a href="https://lospec.com/palette-list/bubblegum-16">BUBBLEGUM 16</a> by <a href="https://twitter.com/PineTreePizza">pine</a></p>
+<p>icons from <a href="https://icons.getbootstrap.com/">bootstrap</a></p>
+
+            </div>
+          </div>
+        </section>
+        <section id="layer-options">
+          <div class="grid4 radio-select" id="option-select">
+            <label>
+              <input type="radio" name="option-select" value="0" title="open option 0"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="option-select" value="1" title="open option 1"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="option-select" value="2" title="open option 2"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="option-select" value="3" title="open option 3"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="option-select" value="4" title="open option 4"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="option-select" value="5" title="open option 5"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="option-select" value="6" title="open option 6"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="option-select" value="7" title="open option 7"><canvas width="128" height="128"></canvas>
+            </label>
+          </div>
+          <div class="grid4 radio-select" id="palette-select" title="palettes">
+            <label>
+              <input type="radio" name="palette-select" value="0" title="select palette 0"><canvas width="48" height="24"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="palette-select" value="1" title="select palette 1"><canvas width="48" height="24"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="palette-select" value="2" title="select palette 2"><canvas width="48" height="24"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="palette-select" value="3" title="select palette 3"><canvas width="48" height="24"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="palette-select" value="4" title="select palette 4"><canvas width="48" height="24"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="palette-select" value="5" title="select palette 5"><canvas width="48" height="24"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="palette-select" value="6" title="select palette 6"><canvas width="48" height="24"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="palette-select" value="7" title="select palette 7"><canvas width="48" height="24"></canvas>
+            </label>
+          </div>
+        </section>
+        <section id="tools" data-hidden-in-player="">
+          <div class="horizontal-capsule radio-select" id="tool-select" title="tools">
+            <label>
+              <input type="radio" name="tool-select" value="freehand" title="freehand paint"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-brush" viewBox="0 0 16 16"><path d="M15.825.12a.5.5 0 0 1 .132.584c-1.53 3.43-4.743 8.17-7.095 10.64a6.067 6.067 0 0 1-2.373 1.534c-.018.227-.06.538-.16.868-.201.659-.667 1.479-1.708 1.74a8.118 8.118 0 0 1-3.078.132 3.659 3.659 0 0 1-.562-.135 1.382 1.382 0 0 1-.466-.247.714.714 0 0 1-.204-.288.622.622 0 0 1 .004-.443c.095-.245.316-.38.461-.452.394-.197.625-.453.867-.826.095-.144.184-.297.287-.472l.117-.198c.151-.255.326-.54.546-.848.528-.739 1.201-.925 1.746-.896.126.007.243.025.348.048.062-.172.142-.38.238-.608.261-.619.658-1.419 1.187-2.069 2.176-2.67 6.18-6.206 9.117-8.104a.5.5 0 0 1 .596.04zM4.705 11.912a1.23 1.23 0 0 0-.419-.1c-.246-.013-.573.05-.879.479-.197.275-.355.532-.5.777l-.105.177c-.106.181-.213.362-.32.528a3.39 3.39 0 0 1-.76.861c.69.112 1.736.111 2.657-.12.559-.139.843-.569.993-1.06a3.122 3.122 0 0 0 .126-.75l-.793-.792zm1.44.026c.12-.04.277-.1.458-.183a5.068 5.068 0 0 0 1.535-1.1c1.9-1.996 4.412-5.57 6.052-8.631-2.59 1.927-5.566 4.66-7.302 6.792-.442.543-.795 1.243-1.042 1.826-.121.288-.214.54-.275.72v.001l.575.575zm-4.973 3.04.007-.005a.031.031 0 0 1-.007.004zm3.582-3.043.002.001h-.002z"></path></svg>
+            </label>
+            <label>
+              <input type="radio" name="tool-select" value="line" title="line paint"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-slash-lg" viewBox="0 0 16 16"><path d="M14.707 1.293a1 1 0 0 1 0 1.414l-12 12a1 1 0 0 1-1.414-1.414l12-12a1 1 0 0 1 1.414 0z"></path></svg>
+            </label>
+            <label>
+              <input type="radio" name="tool-select" value="fill" title="flood fill"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-paint-bucket" viewBox="0 0 16 16"><path d="M6.192 2.78c-.458-.677-.927-1.248-1.35-1.643a2.972 2.972 0 0 0-.71-.515c-.217-.104-.56-.205-.882-.02-.367.213-.427.63-.43.896-.003.304.064.664.173 1.044.196.687.556 1.528 1.035 2.402L.752 8.22c-.277.277-.269.656-.218.918.055.283.187.593.36.903.348.627.92 1.361 1.626 2.068.707.707 1.441 1.278 2.068 1.626.31.173.62.305.903.36.262.05.64.059.918-.218l5.615-5.615c.118.257.092.512.05.939-.03.292-.068.665-.073 1.176v.123h.003a1 1 0 0 0 1.993 0H14v-.057a1.01 1.01 0 0 0-.004-.117c-.055-1.25-.7-2.738-1.86-3.494a4.322 4.322 0 0 0-.211-.434c-.349-.626-.92-1.36-1.627-2.067-.707-.707-1.441-1.279-2.068-1.627-.31-.172-.62-.304-.903-.36-.262-.05-.64-.058-.918.219l-.217.216zM4.16 1.867c.381.356.844.922 1.311 1.632l-.704.705c-.382-.727-.66-1.402-.813-1.938a3.283 3.283 0 0 1-.131-.673c.091.061.204.15.337.274zm.394 3.965c.54.852 1.107 1.567 1.607 2.033a.5.5 0 1 0 .682-.732c-.453-.422-1.017-1.136-1.564-2.027l1.088-1.088c.054.12.115.243.183.365.349.627.92 1.361 1.627 2.068.706.707 1.44 1.278 2.068 1.626.122.068.244.13.365.183l-4.861 4.862a.571.571 0 0 1-.068-.01c-.137-.027-.342-.104-.608-.252-.524-.292-1.186-.8-1.846-1.46-.66-.66-1.168-1.32-1.46-1.846-.147-.265-.225-.47-.251-.607a.573.573 0 0 1-.01-.068l3.048-3.047zm2.87-1.935a2.44 2.44 0 0 1-.241-.561c.135.033.324.11.562.241.524.292 1.186.8 1.846 1.46.45.45.83.901 1.118 1.31a3.497 3.497 0 0 0-1.066.091 11.27 11.27 0 0 1-.76-.694c-.66-.66-1.167-1.322-1.458-1.847z"></path></svg>
+            </label>
+            <label>
+              <input type="radio" name="tool-select" value="pick" title="pick color"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-eyedropper" viewBox="0 0 16 16"><path d="M13.354.646a1.207 1.207 0 0 0-1.708 0L8.5 3.793l-.646-.647a.5.5 0 1 0-.708.708L8.293 5l-7.147 7.146A.5.5 0 0 0 1 12.5v1.793l-.854.853a.5.5 0 1 0 .708.707L1.707 15H3.5a.5.5 0 0 0 .354-.146L11 7.707l1.146 1.147a.5.5 0 0 0 .708-.708l-.647-.646 3.147-3.146a1.207 1.207 0 0 0 0-1.708l-2-2zM2 12.707l7-7L10.293 7l-7 7H2v-1.293z"></path></svg>
+            </label>
+            <label>
+              <input type="radio" name="tool-select" value="shift" title="shift image"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-arrows-move" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M7.646.146a.5.5 0 0 1 .708 0l2 2a.5.5 0 0 1-.708.708L8.5 1.707V5.5a.5.5 0 0 1-1 0V1.707L6.354 2.854a.5.5 0 1 1-.708-.708l2-2zM8 10a.5.5 0 0 1 .5.5v3.793l1.146-1.147a.5.5 0 0 1 .708.708l-2 2a.5.5 0 0 1-.708 0l-2-2a.5.5 0 0 1 .708-.708L7.5 14.293V10.5A.5.5 0 0 1 8 10zM.146 8.354a.5.5 0 0 1 0-.708l2-2a.5.5 0 1 1 .708.708L1.707 7.5H5.5a.5.5 0 0 1 0 1H1.707l1.147 1.146a.5.5 0 0 1-.708.708l-2-2zM10 8a.5.5 0 0 1 .5-.5h3.793l-1.147-1.146a.5.5 0 0 1 .708-.708l2 2a.5.5 0 0 1 0 .708l-2 2a.5.5 0 0 1-.708-.708L14.293 8.5H10.5A.5.5 0 0 1 10 8z"></path></svg>
+            </label>
+          </div>
+          <div class="horizontal-capsule radio-select" id="brush-select" title="brushes">
+            <label>
+              <input type="radio" name="brush-select" value="0" title="1px circle brush"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAABlJREFUOI1jYBgFwx38/////0C7YRQMDQAApd4D/cefQokAAAAASUVORK5CYII=">
+            </label>
+            <label>
+              <input type="radio" name="brush-select" value="1" title="2px circle brush"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAABpJREFUOI1jYBgFwx38hwJ8apjo5ZhRMKgBADvbB/vPRl6wAAAAAElFTkSuQmCC">
+            </label>
+            <label>
+              <input type="radio" name="brush-select" value="2" title="3px circle brush"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAACNJREFUOI1jYBgFgxz8////PyE1jMRoZmRkxKmOYheMgmEBAARbC/qDr1pMAAAAAElFTkSuQmCC">
+            </label>
+            <label>
+              <input type="radio" name="brush-select" value="3" title="4px circle brush"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAChJREFUOI1jYBgFgxz8hwJ8ahjxaUZRyMiIVS0TeW4jEhDjhVEwGAAAJhAT9IYiYRoAAAAASUVORK5CYII=">
+            </label>
+          </div>
+          <div class="grid4 radio-select" id="color-select" title="colors">
+            <label style="background: var(--trans-gradient);">
+              <input type="radio" name="color-select" value="0" title="select color 0">
+            </label>
+            <label style="background: rgb(0, 120, 153);">
+              <input type="radio" name="color-select" value="1" title="select color 1">
+            </label>
+            <label style="background: rgb(16, 210, 117);">
+              <input type="radio" name="color-select" value="2" title="select color 2">
+            </label>
+            <label style="background: rgb(191, 255, 60);">
+              <input type="radio" name="color-select" value="3" title="select color 3">
+            </label>
+            <label style="background: rgb(127, 6, 34);">
+              <input type="radio" name="color-select" value="4" title="select color 4">
+            </label>
+            <label style="background: rgb(214, 36, 17);">
+              <input type="radio" name="color-select" value="5" title="select color 5">
+            </label>
+            <label style="background: rgb(255, 132, 38);">
+              <input type="radio" name="color-select" value="6" title="select color 6">
+            </label>
+            <label style="background: rgb(255, 209, 0);">
+              <input type="radio" name="color-select" value="7" title="select color 7">
+            </label>
+          </div>
+          <div class="button-row" id="toolbar" title="toolbar">
+            <button name="undo" title="undo"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-arrow-counterclockwise" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 3a5 5 0 1 1-4.546 2.914.5.5 0 0 0-.908-.417A6 6 0 1 0 8 2v1z"></path><path d="M8 4.466V.534a.25.25 0 0 0-.41-.192L5.23 2.308a.25.25 0 0 0 0 .384l2.36 1.966A.25.25 0 0 0 8 4.466z"></path></svg></button>
+            <button name="redo" title="redo" disabled=""><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-arrow-clockwise" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"></path><path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"></path></svg></button>
+            <button name="copy" title="copy image"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-files" viewBox="0 0 16 16"><path d="M13 0H6a2 2 0 0 0-2 2 2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h7a2 2 0 0 0 2-2 2 2 0 0 0 2-2V2a2 2 0 0 0-2-2zm0 13V4a2 2 0 0 0-2-2H5a1 1 0 0 1 1-1h7a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1zM3 4a1 1 0 0 1 1-1h7a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4z"></path></svg></button>
+            <button name="paste" title="paste image" disabled=""><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-clipboard-data" viewBox="0 0 16 16"><path d="M4 11a1 1 0 1 1 2 0v1a1 1 0 1 1-2 0v-1zm6-4a1 1 0 1 1 2 0v5a1 1 0 1 1-2 0V7zM7 9a1 1 0 0 1 2 0v3a1 1 0 1 1-2 0V9z"></path><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"></path><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"></path></svg></button>
+            <button name="clear" title="clear image"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-trash" viewBox="0 0 16 16"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"></path><path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"></path></svg></button>
+            <button name="randomise" title="randomise selections"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-shuffle" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M0 3.5A.5.5 0 0 1 .5 3H1c2.202 0 3.827 1.24 4.874 2.418.49.552.865 1.102 1.126 1.532.26-.43.636-.98 1.126-1.532C9.173 4.24 10.798 3 13 3v1c-1.798 0-3.173 1.01-4.126 2.082A9.624 9.624 0 0 0 7.556 8a9.624 9.624 0 0 0 1.317 1.918C9.828 10.99 11.204 12 13 12v1c-2.202 0-3.827-1.24-4.874-2.418A10.595 10.595 0 0 1 7 9.05c-.26.43-.636.98-1.126 1.532C4.827 11.76 3.202 13 1 13H.5a.5.5 0 0 1 0-1H1c1.798 0 3.173-1.01 4.126-2.082A9.624 9.624 0 0 0 6.444 8a9.624 9.624 0 0 0-1.317-1.918C4.172 5.01 2.796 4 1 4H.5a.5.5 0 0 1-.5-.5z"></path><path d="M13 5.466V1.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384l-2.36 1.966a.25.25 0 0 1-.41-.192zm0 9v-3.932a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384l-2.36 1.966a.25.25 0 0 1-.41-.192z"></path></svg></button>
+            <button name="import-palette" title="restart with imported palette" hidden=""><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-palette" viewBox="0 0 16 16"><path d="M8 5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zm4 3a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM5.5 7a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0zm.5 6a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z"></path><path d="M16 8c0 3.15-1.866 2.585-3.567 2.07C11.42 9.763 10.465 9.473 10 10c-.603.683-.475 1.819-.351 2.92C9.826 14.495 9.996 16 8 16a8 8 0 1 1 8-8zm-8 7c.611 0 .654-.171.655-.176.078-.146.124-.464.07-1.119-.014-.168-.037-.37-.061-.591-.052-.464-.112-1.005-.118-1.462-.01-.707.083-1.61.704-2.314.369-.417.845-.578 1.272-.618.404-.038.812.026 1.16.104.343.077.702.186 1.025.284l.028.008c.346.105.658.199.953.266.653.148.904.083.991.024C14.717 9.38 15 9.161 15 8a7 7 0 1 0-7 7z"></path></svg></button>
+          </div>
+        </section>
+      </main>
+      <div class="hanging-menu" data-hidden-in-player="">
+        <button name="play" title="playtest this flickguy">play</button>
+        <button name="export" title="export as webpage">export</button>
+        <button name="import" title="import from webpage">import</button>
+        <button name="reset" title="reset to blank">reset</button>
+        <button name="help" title="how to use this tool">help</button>
+      </div>
+      <div class="hanging-menu" data-hidden-in-editor="" hidden="">
+        <button name="export-image" title="download as image">save image</button>
+        <button name="randomise" title="randomise selections">randomise</button>
+        <button name="edit" title="remix this flickguy">remix</button>
+      </div>
+    </div>
+    <script id="bundle-embed" type="application/json">{"project":{"palettes":[["#000000","#94216a","#ff2674","#ff80a4","#34111f","#73392e","#c76e46","#ffb762"],["#000000","#d62411","#ff8426","#ffd100","#73392e","#c76e46","#eb9c6e","#ffdaac"],["#000000","#007899","#10d275","#bfff3c","#430067","#94216a","#ff2674","#ff80a4"],["#000000","#94216a","#ff2674","#ff80a4","#002859","#007899","#10d275","#bfff3c"],["#000000","#d62411","#ff8426","#ffd100","#1b1023","#002859","#007899","#68aed4"],["#000000","#002859","#007899","#68aed4","#430067","#94216a","#ff2674","#ff80a4"],["#000000","#007899","#10d275","#bfff3c","#7f0622","#d62411","#ff8426","#ffd100"],["#000000","#002859","#007899","#68aed4","#7f0622","#d62411","#ff8426","#ffd100"]],"layers":[{"options":[{"image":"1248","palette":5},{"image":"1147","palette":0},{"image":"1221","palette":5},{"image":"1230","palette":6},{"image":"1239","palette":2},{"image":"1275","palette":4},{"image":"1266","palette":5},{"image":"1205","palette":2}]},{"options":[{"image":"1206","palette":5},{"image":"1259","palette":7},{"image":"1214","palette":3},{"image":"1156","palette":6},{"image":"1223","palette":2},{"image":"1250","palette":4},{"image":"1232","palette":4},{"image":"1280","palette":6}]},{"options":[{"image":"1190","palette":2},{"image":"1242","palette":0},{"image":"1269","palette":6},{"image":"1182","palette":5},{"image":"1260","palette":5},{"image":"1233","palette":3},{"image":"1215","palette":4},{"image":"1166","palette":5}]},{"options":[{"image":"1191","palette":3},{"image":"1216","palette":6},{"image":"1261","palette":5},{"image":"1183","palette":2},{"image":"1114","palette":1},{"image":"1225","palette":3},{"image":"1167","palette":7},{"image":"1270","palette":6}]},{"options":[{"image":"1253","palette":7},{"image":"1271","palette":6},{"image":"1262","palette":7},{"image":"1217","palette":0},{"image":"981","palette":0},{"image":"1209","palette":4},{"image":"1244","palette":7},{"image":"1226","palette":0}]},{"options":[{"image":"1254","palette":4},{"image":"1227","palette":5},{"image":"1263","palette":7},{"image":"1218","palette":1},{"image":"1160","palette":1},{"image":"1272","palette":3},{"image":"1245","palette":7},{"image":"1177","palette":1}]},{"options":[{"image":"1237","palette":1},{"image":"1144","palette":2},{"image":"1219","palette":1},{"image":"1264","palette":1},{"image":"1255","palette":5},{"image":"1211","palette":1},{"image":"1273","palette":6},{"image":"1228","palette":6}]},{"options":[{"image":"1187","palette":6},{"image":"1274","palette":3},{"image":"1265","palette":2},{"image":"1212","palette":3},{"image":"1195","palette":2},{"image":"1136","palette":4},{"image":"1162","palette":5},{"image":"1256","palette":4}]}]},"resources":{"981":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACcElEQVR4Xu3XwU3DUBQF0aQEKqAJ+q+AJqiAEkAGWbIs23FY4T+HFQIjcedNJnC/+UgTuKfXG38jQFwCAhAgTiA+XwEIECcQn68ABIgTiM9XAALECcTnKwAB4gTi8xWAAHEC8fkKQIA4gfh8BSBAnEB8vgIQIE4gPl8BCBAnEJ+vAASIE4jPVwACxAnE5ysAAeIE4vMVgABxAvH5CkCAOIH4fAUgQJxAfL4CECBOID5fAQgQJxCfrwAEiBOIz1cAAsQJxOcrAAHiBOLzFYAAcQLx+QpAgDiB+HwFIECcQHy+AhAgTiA+XwEIECcQn68ABIgTiM9XAALECcTnKwAB4gTi8xWAAHEC8fkKQIA4gfh8BSBAnEB8vgIQIE4gPl8BCNAi8Pby+vX++fEj/vT5mfXz82eevdozwxfg6MjTYefvbx15luXomasdfP37DinA+ujL4y4LMMPY+tpciHUtRqvBUAIsD7883F8E2HrVj1iCYQTYO8761X22AGeqcPX8T7//UAIcvY8f5f6sFOu3BQL8IwJnX7F7x96asn7rmJ8Z6e+AoQowHWjvaI9cPfNzIx1+5jGMAHv/1494tEcyP/P9oQR4ZrhnfwkQIG4CAQgQJxCfrwAEiBOIz1cAAsQJxOcrAAHiBOLzFYAAcQLx+QpAgDiB+HwFIECcQHy+AhAgTiA+XwEIECcQn68ABIgTiM9XAALECcTnKwAB4gTi8xWAAHEC8fkKQIA4gfh8BSBAnEB8vgIQIE4gPl8BCBAnEJ+vAASIE4jPVwACxAnE5ysAAeIE4vMVgABxAvH5CkCAOIH4fAUgQJxAfL4CxAX4BiugmIHQZZ1uAAAAAElFTkSuQmCC"},"1114":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAADnElEQVR4Xu2dUW7jMAxEk8vsifaYe6JeJkV2YdRrpAU0UkRy+Ppt2pqZJ0p2nPR+46+1A/fW6hF/A4DmEAAAADR3oLl8OgAANHeguXw6AAA0d6C5fDoAADR3YFD+4+PP4/7rt83EsREymKN8OADI1tUvfIb/VEEHqJ+lpMBt9v+FWXKiadEZAJduAAADMJ9Dd+kGADAAwPPQAwKXvQAADAJwQOCyEQQAAQCnEgBwSlPQYguAyyZNyHSoBACG7PI7GAD8Mh1SZA8AS8HPPADA0Hx5fXBlyAAAABY4kPAUx6zcMTt3XONdFlt3gMO0HU/tqkJgC4DyyHYmxJ0dZ2U3sAZg1CgAGHXM7HgAMAt0VA4AjDpmdvzMOl71PQH2ACeIZwCoOhcA4ALAzlvHDNAAwAsAdjw3yBD+cwwAkCWJoHEAQJDxyoOqdww1FICZ2653mLH7nBn0A8Du1F/cdQQOIXYPkGEGRJp//aZRxOaTDhBIAABcvmvfrSMAwOXr1l0BiNQdugScb4Vcvm07sqJk+PwgHIAs98Mjwb06NnIWz4w9BQAzArLUAkCWJALGUTV8PgtYBAsALDKy6mmuAFQCgj3AAuoAYIGJ1U9R9W0iOsAi8jLc0ytSAEBxzagGAIzCVKQAgOKaUQ0AGIWpSAEAxTWjGgAwClORAgCKa0Y1AGAUpiIFABTXjGoAwChMRQoAKK4Z1QCAUZiKFABQXDOqAQCjMBUpAKC4ZlQDAEZhKlIAQHHNqAYAjMJUpACA4ppRDQAYhalIAQDFNaMaADAKU5ECAIprRjUAYBSmIgUAFNeMagDAKExFCgAorhnVAIBRmIoUAFBcM6oBAKMwFSkAoLhmVAMARmEqUmwBqPQ7PUpwq2oAYJWTRc8DAEWDWzXsFgCwHHyPiz0AHX+EeqQ7tAAg4j9xjIQQeSwARLqf4NrWABz+0gEa7gESTK4SQ7DtACXcTzBIAEgQQuQQACDS/QTXBoAEIUQOAQAi3U9wbQBIEELkEAAg0v0E1waABCFEDqEdAHwy+D9uABA5/RJcGwAShBA5BACIdD/BtVsDwH7gdmsLAG8K/Ws/LQHgPYGvtacdAAmW3VRDAIBUcewfDADs9zzVFQFgIg6HuwgAAIAJB5qX0gEA4FH9lXOWgAmIzx2gajcAAACYcKBx6fVRMh2gIQwHBJUfLbMENAT3LBkAAKC5A83l0wEAoLkDzeXTAQCguQPN5dMBmgPwCVxDwJCq1BcgAAAAAElFTkSuQmCC"},"1136":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACr0lEQVR4Xu2YMU4DARDEkh/QU/L/J1HS8wPQCUUUSNw5pce0MIVnfHsJ91s/0w3cp+mDvyXAuAQJkADjDYzjdwESYLyBcfwuQAKMNzCO3wVIgPEGxvG7AAkw3sA4fhcgAcYbGMfvAiTAeAPj+F2ABBhvYBy/C5AA4w2M43cBEmC8gXH8LkACjDcwjt8FSIDxBsbxuwAJMN7AOH4XIAHGGxjH7wIkwHgD4/hdgAQYb2AcvwuQAOMNjON3ARJgvIFx/C5AAow3MI7fBUiA8QbG8bsACTDewDh+FyABxhsYx5+9AK8vb18fn++z/A/vZwtIgB8FEqBXwGYDXYDhC3CMf+D3GWD0FdDT/3v1VZ8BHk/2lZdaT7/sFdBZv6L937/RXIDO+rAAPf3Pja/6P0AX4DkJVK+AvtpxCTQCHOi9CsYFOJPgytfEta+Hqgvw8P+/odcGPrsJSgHOoPu99D+BDcsb6ALwzlSJBFDNyWESgHemSiSAak4OkwC8M1UiAVRzcpgE4J2pEgmgmpPDJADvTJVIANWcHCYBeGeqRAKo5uQwCcA7UyUSQDUnh0kA3pkqkQCqOTlMAvDOVIkEUM3JYRKAd6ZKJIBqTg6TALwzVSIBVHNymATgnakSCaCak8MkAO9MlUgA1ZwcJgF4Z6pEAqjm5DAJwDtTJRJANSeHSQDemSqRAKo5OUwC8M5UiQRQzclhEoB3pkokgGpODpMAvDNVIgFUc3KYBOCdqRIJoJqTwyQA70yVSADVnBwmAXhnqkQCqObkMAnAO1MlEkA1J4dJAN6ZKpEAqjk5TALwzlSJBFDNyWESgHemSiSAak4OkwC8M1UiAVRzcpgE4J2pEgmgmpPDJADvTJVIANWcHCYBeGeqRAKo5uQwCcA7UyUSQDUnh0kA3pkqkQCqOTnMN1HsQIF7HmHjAAAAAElFTkSuQmCC"},"1144":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAEaUlEQVR4Xu2ZQY4TMRREJwfgGsOCC7BgARJHYsmSJUdCggULLsCCuQYHCHIkSx6P3R27K8Gl/2YTTdL9u37V8293cnrgL7QDp9Dd0/wDAASHAAAAILgDwdtnAgBAcAeCt88EAIDgDgRvnwkAAMEdCN4+EwAAgjsQvH0mAAAEdyB4+0wAAAjuQPD2mQAAENyB4O0zAQAguAPB22cCAEBwB4K3zwQAgOAOBG+fCQAAwR0I3j4TAACCOxC8fSYAAAR3IHj7TAAACO5A8PaZAAAQ3IHg7TMBACC4A8HbX34CfD+/O+eMPpx+vtC793nwfHfbXxqAMtzUSQ1A/XnrmF0HNg6IAJcVAGXA58dP5x9/fr2IrzUlZiBowaUGbEaX+pylAcghv3/99tJ3GXh6rwWAKqQeAOm6p6evz3zLx6rgU4e8VW9ZAJKpOfhW+OV7NQyKIHoTZgs8FXzhAShX3zWrvwQlmVev0FFDS/jqKdPSU9ZXwDeq98jxy02A1uitV11rFZbBHAmhhq8HQD2Vtp5UjgR063MtAChN+HJ6c/n38/n35bV3m5iFIAPQW+l7t4DWHuHWIR6pbwVADj83nCHoGTADQW8C5Gt/e3zV3XxmaI7ego4EOnru0gDk1ZaN/fj091l/ewDMbMpat6BrwKsn0Qx8o+Epjl8OgNTU1iawvgXsmTAaxCwA5e0o7xtGr73Xyy0+twCg97x/jSEjIbQePfMUGgXPZVO4JADJvPQcnk0cAaDevI0AUF5z5Nq3/lLqGtBnj1kegNHn8HoUjwBQ3n56oW69n86v9Y5efzbI2fOWBaBsqLczb4WRDC9H+eiO/NrvAVpTqadnNpx7nGcBQL0yS2NuseHq/Q7Q2uiVWlrfHTABRBj3VuY9Dc6TZWvMl78h3FPbrM02E6D1eDg63mdNKs+rfyRyCHmrbysAciMphP8RvgKg1WpYArCaic56AMA5PYF2ABCY6FwCAJzTE2gHAIGJziUAwDk9gXYAEJjoXAIAnNMTaAcAgYnOJQDAOT2BdgAQmOhcAgCc0xNoBwCBic4lAMA5PYF2ABCY6FwCAJzTE2gHAIGJziUAwDk9gXYAEJjoXAIAnNMTaAcAgYnOJQDAOT2BdgAQmOhcAgCc0xNoBwCBic4lAMA5PYF2ABCY6FwCAJzTE2gHAIGJziUAwDk9gXYAEJjoXAIAnNMTaAcAgYnOJQDAOT2BdgAQmOhcAgCc0xNoBwCBic4lAMA5PYF2ABCY6FwCAJzTE2gHAIGJziUAwDk9gXYAEJjoXAIAnNMTaAcAgYnOJQDAOT2BdgAQmOhcAgCc0xNoBwCBic4lAMA5PYF2ABCY6FwCAJzTE2gHAIGJziUAwDk9gXYAEJjoXAIAnNMTaAcAgYnOJQDAOT2BdgAQmOhcAgCc0xNoBwCBic4lAMA5PYF2ABCY6FwCAJzTE2gHAIGJziUAwDk9gXYAEJjoXAIAnNMTaAcAgYnOJQDAOT2BdgAQmOhcAgCc0xNo/wfl4FqQQeSbIAAAAABJRU5ErkJggg=="},"1147":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAB60lEQVR4Xu3YQREAIBDDwMMqJpEHM9jI4uBIHm3XPfuOl/2BRYAs+384Adr8CRDnTwACCIFpB2SANH4hMI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+AlAADtA2wEZoM1fDYzzJwAB7ABpB2SANH41MI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+AlAADtA2wEZoM1fDYzzJwAB7ABpB2SANH41MI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+AlAADtA2wEZoM1fDYzzJwAB7ABpB2SANH41MI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+AlAADtA2wEZoM1fDYzzJwAB7ABpB2SANH41MI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+AlAADtA2wEZoM1fDYzzJwAB7ABpB2SANH41MI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+AlAADtA2wEZoM1fDYzzJwAB7ABpB2SANH41MI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+AlAADtA2wEZoM1fDYzzJwAB7ABpB2SANH41MI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+GcetoiMENLyTmcAAAAASUVORK5CYII="},"1156":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAFUklEQVR4Xu2c63HeIBBF7Q5SSbpzFekulaSDeGSPMoQPxC7sE67/GvHYc7ggecbvb/g5ugLvR68ei3+DAIdLAAEgwDkV+PH74++fn78gfYH8qGJAgNfNfowAF/xy+UiC72ocIUAN/1o4BDhcAEgAAb4qYJEEZQJZjMe51h97BNxF0gLSOnashIMARQV6ILQEeBpPSzYO8LqtWwJY3cpHAkjtSqtxVmC3nnUT4JqMxW6xAEMZQ0q0rQQYSbBaNG0w1P5X1yENvezPNQHuiWgVktrvzNlM7VvrriElRQgBNETgAOIIwOk3OvzQXwI5hW4BXH2+tcM4fWaAH1qA1VTgwhqlALc/CCB1SA3eFlrDXDC5wHoCcPup5zMSS7BMU12FugM8rWAVxKg6NSiJ8aLDT3EEzBwFI9i939/AJOBHfvUL9xpIBSYF5kkAyTGQAFSyzHaSkJhDk5tngJ/qCCgrDwHIHg4bprkE1iuJLgESYOjeeoPIEkCAdb7dHiKDz3L7v4sb7giIDpfidZbd73YJ3AHy6FsCRZQIbUwSYGfgNcRMu181AU6CXkpwrACnAs8MfzkBAP3/AyDb7ocAwrew4wTI9nlWmPdydxGEEX8LwLGw5oW1FOIC3MuHCGsiWH1RVBMAIkCAZgWQDDQxrI4C9QQYLRdCvFbICv7ya+AILvX3kMDm/xS0eLgnwOl3BcvdHlqAa3KnJIE39FIEJAD1nBJqFwl+iDvAKbve6r2e66lrAgA+F5d8ezcBAF8e5kyP5gKcBD5q7LtdAgF/Zo/qPmOWAKfBv7FFu/XXOkEA3Q321XtkCUwEOHX3125FFEFVAID3/UMPJdwgAKVKgm2ipYCaANj9z9ZEEUFFAMCnR4a3COICAD4dftnSSwQIMMdL5SkPCUQFwO6X8cJSBDEBAF8GvvUXRBEBAF8WvqUEywIAvg58KwkggC6/5d617wPLAtQrrBOBugAkSd8Vag1nbBMXYGYS1zMQwOfLYQgBAJ++baTTAALQax+iJQQIgcF3EpISIAGUWUrC0piquwC7nf/RgdcSQYCFbZUNdmuprgJk3/0QYGH37PDuDwEWBMi++62+1S+UmPSo2xEAAUh81BtBAIESZz4KXATYZfeX7mSVAAIIJEDm+wAEgACCFSB0lSX+y0jnzDnbUWCeAJxiEnz61+QuvFT/PZCU/jNJsIUAs7v1SbARxCcRRs9yxNZum16AutiUHUop6ggiBKBUsWojBefqdiWiKVMfCXD30VsT9XnKXDTbmCaAlABPxbUYowbSGhMCNLRdhUMp6uoYs+/0WSVIkQAU8KNI5sYoZ8zeXza5fXDnKNE+rACzxfNKgJ6As+uQgEvpI5wAqwWTEGB1DmUiSPRFATnbxkwAq9emKAJkkcBVAI3dISHA02smd6dd89FYJ3cevfYuAmgWBALw1DAXQBN+7zbOK8l3a+15zsxJ4xlTASyKGi0BNKBJ9mkmgOSkn/qCALxKQ4BOvSzSiodKpzUEgAA6Znn1iiOAV3kkABKAZ0z01kgAHiEkABKAZ0z01kgAHiEkABKAZ0z01kgAHiEkABKAZ0z01kgAHiEkwEO9TvgcvJUAUrv/dgIC8NLEvbW0ACeIsEUCaIFvGb1bKqQXwBJ+L+IyS5FWgAjgd0iIlAJEhZ/xzpBOgOjws0mQRoAs4OtjIfr9IIUAWeFnSAMIYPj1ImIahBYg+85/ciuKDGEF2Bl+pKMhnAAngC+TwTsJQglwGvwISQABDC+BEe8EIQQ4dedH+JTsKgDAvypgfSdwEwDw2wfC9gIA/PjSYSmBWQIA/Bi8x1vBJwWuuJ+LlM4SAAAAAElFTkSuQmCC"},"1160":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAE9klEQVR4Xu2aW3YbMQxD4810lf3sKruZ5Dg9dh17ZBGSRgIF9NdjhwAvocf08uF/0g5cpNVb/IcBEIfAABgAcQfE5TsBDIC4A+LynQAGQNwBcflOAAMg7oC4fCeAARB3QFy+E8AAiDsgLt8JYADEHRCX7wQwAOIOiMt3AhgAcQfE5TsBDIC4A+LynQAGQNwBcflOAAMg7oC4fCeAARB3QFy+E8AAiDsgLt8JYADEHRCX7wQwAOIOiMt3AhgAcQfE5TsBDIC4A+LynQAGQNwBcflOAAMg7oC4fCeAARB3QFy+E8AA5HPg88+vz8vvv4Z3QOtSmXht/KPmWRDc/u6svzegr+GfSAPAquZfndw5cegBeG78De1Z07jz9F+9pAWg1Pjvoieu/wYgvJqMefBd41c1f3bqjHEy9itUCcDU/Nva/2zjzPSJtbDvKQoAao1fNYGr9x99rY19ezkArM0vJcAqGGPtxJ9aBkC08bPX/UcLazXusBwsAaBm7IrLnqPZidSZHQJqAFabGwFgZULhgf/6jekAZDM1W70oFFMBiJi5eurVloJpAESazx6nNQ2M8NYSgQoAdgMNQA2nN5/XzGOf/tq9QNb7gSkJEGl+BgMjOthT7OVqu2Oow1+NGMdy9n8nKqLDABQcjJjHDkFUQyYIpiwB0fXzJZ4mvvePxJkBiLhUeSZqItueIFp3pun/3ngP6Cn0E1EjmQBAajYAARwQQ1ceD9E6V9YasP3wkekJcKsCMXfVVCE1MiUWAsMyAJCNYRYAVtWJNHzJPUCpwOiErTA2WlvWyb/X3UNP73ejJs8GIFoX+71FpD9eAg5cMgARdAY8EzXaCTDA7MJPOAEGJUDGI+CSi6Asx8BoOr3sqsmur2vZMT0BUGNnx/+jYWitGU8EpwLQaiDT7rpFw0poaxN/+j1Ai2GlolmMbNHEUnsNiKEJ0GIUe/N7loQMEAwDYPfmZ9m81ib+lCVgVPMzTAyiNYOe7gRADHlHZwazrvWjetl1LQeA3aBnaA3AkyOoIRnPyjtvBJckQLapNwBvFu+WBMgKAKo1g04nAHBuMgAFs1BjMr45QzVmmP6hbwN3NWjHo9+Pdy1AAlYfRSFgT4Ld9Bw1sHsPcPSjqHGMcYlqYIe5+M6lOtaND6AGskGQvf5o205JgJYXJywTpNL4+4VclJTW5xBDGVIAqZcF2tbeDD0FlIrIZmi2enuabwAO3EMAYEgsA9DrwMP3kebvEP+nJwBq6GpT0XqdAIXpQ438cTO1+P/Vo7Vnh2DYMRA1rngxYQAGLmr1n+oGYFTj7+fSxQBc60A1ZU6BLgBQo2o8MhmJaGOqu+bx8+fNACAGRYpiMxHVx1Z/xPOuUwBqENNGL2oOuhxkhKApAVqbn9Gg3SGAAVBr/i0tUN1ZYJ8CQBYzakvDjhAYgFrXnz7fDQIDYAAwB9AJWH2/j6mLPY16wLwEwgmA7ooNwD+oWCFoAkAdAjQBtgSg5XjEOgWx4P//lAF4cAw1YwcIUM1ML7qGvQt4/CHUkMwQoFrZr8Cb9wA9ADCvibXlwAAcONRqSrYkaNXpJaAwVgagljfnf968BPROA/NUHNk+Qi8j8DAAI4xg3xj17m9Kc5segNHNZ98MjtabGoDRZjAvAWdoZWz+9wBGthlnGMIIgIrOH0twDYAzTWFaAlR0wjeBCsYoaCwN+he/K4yfwXtP+QAAAABJRU5ErkJggg=="},"1162":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACr0lEQVR4Xu2ZwU0DARDELrVRDDVRDLWBIhQRUALnr8e8mYdnnL1Tcjn6m27gMk0f/JEA4xIkQAKMNzCO3wVIgPEGxvG7AAkw3sA4fhcgAcYbGMfvAiTAeAPj+F2ABBhvYBy/C5AA4w2M43cBEmC8gXH8LkACjDcwjt8FSIDxBsbxuwAJMN7AOH4XIAHGGxjH7wIkwHgD4/hdgAQYb2AcvwuQAOMNjON3ARJgvIFx/C5AAow3MI7fBUiA8QbG8bsACTDewDh+FyABxhsYx+8CJMBOAy/H68f78Zb0d5NPlXEV4MqeBN8GzAhwGz8Bfl78BNh5Aj4kTYAE8Ddwf/57BAw+An4LkARjL4EJ8PzK698BHo3fBRi6AM8ESIIvCdQX4K/xEyAB+kZw/QJ0BcSPgP/O/+01aP13Ae07QAKc+4IvAcZ/HlYKcPbT32NA+g6QAOfOv/57gPM17P6n8hGwOycnTwDemSqRAKo5OUwC8M5UiQRQzclhEoB3pkokgGpODpMAvDNVIgFUc3KYBOCdqRIJoJqTwyQA70yVSADVnBwmAXhnqkQCqObkMAnAO1MlEkA1J4dJAN6ZKpEAqjk5TALwzlSJBFDNyWESgHemSiSAak4OkwC8M1UiAVRzcpgE4J2pEgmgmpPDJADvTJVIANWcHCYBeGeqRAKo5uQwCcA7UyUSQDUnh0kA3pkqkQCqOTlMAvDOVIkEUM3JYRKAd6ZKJIBqTg6TALwzVSIBVHNymATgnakSCaCak8MkAO9MlUgA1ZwcJgF4Z6pEAqjm5DAJwDtTJRJANSeHSQDemSqRAKo5OUwC8M5UiQRQzclhEoB3pkokgGpODpMAvDNVIgFUc3KYBOCdqRIJoJqTwyQA70yVSADVnBwmAXhnqkQCqObkMAnAO1MlEkA1J4f5BCUNNoE1EDWgAAAAAElFTkSuQmCC"},"1166":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC0ElEQVR4Xu2bwU3DABAEndoohpoohtqI8ogwIQHNd3Z472d2x2eMxOXoZ7qByzR98EcCjEuQAAkw3sA4fhcgAcYbGMfvAiTAeAPj+F2ABBhvYBy/C5AA4w2M43cBEmC8gXH8LkACjDcwjt8FSIDxBsbxuwAJMN7AOH4XIAHGGxjH7wIkwHgD4/hdgATYauDteP+6EX8eH8l/HHv/GJIAPx/4qafgPn4X4FuCBNh6A/6inRHg/PR3AQYvQAI8P3UTF+Bx/C6A+AI8G/uOe/v06xdB+VcAEeAsxrmWpYsx8Qp4fPv9JcmrjwLrH44mBfjvaX91GYxfjPMCGEclTAlA2hJmE0A4KkFKANKWMJsAwlEJUgKQtoTZBBCOSpASgLQlzCaAcFSClACkLWE2AYSjEqQEIG0JswkgHJUgJQBpS5hNAOGoBCkBSFvCbAIIRyVICUDaEmYTQDgqQUoA0pYwmwDCUQlSApC2hNkEEI5KkBKAtCXMJoBwVIKUAKQtYTYBhKMSpAQgbQmzCSAclSAlAGlLmE0A4agEKQFIW8JsAghHJUgJQNoSZhNAOCpBSgDSljCbAMJRCVICkLaE2QQQjkqQEoC0JcwmgHBUgpQApC1hNgGEoxKkBCBtCbMJIByVICUAaUuYTQDhqAQpAUhbwmwCCEclSAlA2hJmE0A4KkFKANKWMJsAwlEJUgKQtoTZBBCOSpASgLQlzCaAcFSClACkLWE2AYSjEqQEIG0JswkgHJUgJQBpS5hNAOGoBCkBSFvCbAIIRyVICUDaEmYTQDgqQUoA0pYwmwDCUQlSApC2hNkEEI5KkBKAtCXMJoBwVIKUAKQtYTYBhKMSpAQgbQmzCSAclSAlAGlLmE0A4agEKQFIW8JsAghHJUgJQNoSZhNAOCpBSgDSljCbAMJRCVICkLaE2QQQjkqQEoC0JcwmgHBUgpQApC1hNgGEoxKkK4yqKoFVKnB7AAAAAElFTkSuQmCC"},"1167":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAD40lEQVR4Xu2dW5bTMBBEkxWx/2WwonAMGJwMxrLUtrq67vzMx+jV1bfLkhXI88GPtQJP6+gJ/gEA5hAAAACYK2AePg4AAOYKmIePAwCAuQLm4eMAAGCugHn4OAAAmCtgHj4OMADA6/vj9fym/TodAAYBWLorQwAAAwAsXdVdAAAAYFAB8+5bB1B0AzsHiE4SAIg5AAC8JwwHGAR4BWr5rXgiAIBAABSPgwAQAIBi5a9hA8AgAOrdrQGI3hAqwgAA4u/yR6EDAAAYZUir//bYprhrj1bb0gH+7IAbq7/yXsEOgPUG78zRDQCifUdsPAAQS1jkcisn/6cLRopVcSz1276jnEgDcEd1ql/2SAFwNqFn2x+J8a+/Vz82pnKAswk9274HgJ5TQ+88M/qVAUD1Pn5G0rdzpgJgrbbPN3R7lZ5tg3aXI0VCAwCBagJAkJiflb331i7bBg0AAgF4e07tvLPP9twHgCAA9vYCgcOHD6WYfN4EBmIAAIFiKg6V7UTSqmG6U0DrwrO1A4BsGbl5PdlOJK3h4wCtSh20W08ke0fWoGnChwGAQEmzHUtbQgOAFpUKtwGAwsltCQ0AWlQq3AYACie3JTQAaFGpcBsAKJzcltBuBUDxmNQionKb2wHg3+PlwuU2ALbVX9EJuA1seFW6Vr+qWP8LUTWmWx1gAUBVqCPj5jawwQHWJhX3Ab0AzC6IWxxA9absqOq3f++9DrYAYBFqdqBnktnTdhSAWfrc4gA9gqr16XW5XnCi9AGAKCU7xwGATuGqdJv9TgQHmEwSAExOwOzpAWB2Bszn5xEAAOYKmIefzgFmvRBx5QAAXDP/O+7UAOAG19MJANdrnHqGtABQ/fdwAwD36Jx2lnQAOFwdZ6IhJQCZBKq+FgConuGD+AAAAMwVMA8fBwAAcwXMw8cBAMBcAfPwcQAAMFfAPHwcAADMFTAPHwcAAHMFzMPHAQDARwE+ZfQ111YOAAAA8Kr439OMeDgOMKJegb62APA4+EUvABSo4pEQAGBEvQJ9LQHA/v+SawfAGjqnAcM9wBIy1f/+3LJygAKP7PAQACBcUq0BAUArX+GrBYBwSbUGBACtfIWvFgDCJdUaEAC08hW+WgAIl1RrQADQylf4agEgXFKtAQFAK1/hqwWAcEm1BgQArXyFr1YeAG73xpgAgB39XMACAAAYs5DZvfcqdbSCrxp3tl6f85d1gCsAmP0FT1fAAwCNj4BRoK5IXsSYJQBYhVg/6BlRqduvgl3Gr/ohUnkAtlXQ+/29EZWkOkYpAFSTMHPdADBT/QRzA0CCJMxcAgDMVD/B3ACQIAkzl/ADz+jakGXlPPsAAAAASUVORK5CYII="},"1177":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAFN0lEQVR4Xu2dUY4UMQxEdy/DKfnklFwGNKCWWq3pie3YFaer+GSTTlx+LidZJL6/9IdagW/q6BX8lwAgh0AACAByBcjDlwMIAHIFyMOXAwgAcgXIw5cDCAByBcjDlwMIAHIFyMOXAwgAcgXIw5cDCAByBcjDlwMIAHIFyMOXAwgAcgXIw5cDCAByBcjDlwMIAHIFyMOXAwgAcgXIw5cDCAByBcjDlwMIAHIFyMOXAwgAcgXIw5cDCAByBcjDlwMIAHIFyMOXAwgAcgXIw5cDCAByBcjDlwMIAHIFyMOXAwgAcgXIw5cDCAByBcjDlwMIAHIFyMNv7QB/fv3488rP98/frfe5M0NthT2S3wWAp8LYDoBz4o/KWu0A3WDMdJxtAXglBQWGAMhE7sO3rNWPTsh1XyjwELK3cYB3yb/r/0gArFAiklWxhgAYqCoAKrC7fNNT/a+pSEsWAALg31vE9c9TzgEtWoC3ylY7QJe3iYzabAnAp+rywjIrkrc9za6Hnt8CgHNfH1krEoC75MsB0JgODo0jaKLbFQBR5Yrnoc4AEQCQL5QZMrdpAZ5gOgNwtLMqV/LoZBm7JQCeM4NFhLsxEQdA7W0mrvPcbQHIEmD0neihc5dWIABGBFxeHq3Wjvx9hSGE2yFLAdilSiICo84pkb21aAFP/Rc2h7jR1jGbUO/8JQ6wiz16xTyP3+UFcXsAOreRHVwADkBmb0S1kShkAmDwhDv7po5qJVHQBAA5AOdHoUMK6zVy5vzhmQttAZkVkdlKPgk26zKz8z3JjIyFAeBJvqXnrgBgtmVFElQ9px0Aln6LvGKhQKtO9N33YQBY+2EnADyutSqBs+tCAbBsVgBYVMob0woA64EJ1QLkAHmgDb/k6bUCYCineUAbBxAA5pylDmwBQMRqI3O8yiHW8O4pe/xjAKh6YbOeS7ITg/peSwCqkokS9VjH8qCF3tN1PSgAd1c8T/9fLZhnfcuV1vO9irHtAHhK9V8fvrrGBQPg6b30XXXu4GwQAHYQosJed7hFlAOwgwgVyX/3u4/X33VrBaUAoF7sqhJ4JHEmad0LoAyAu+RnVwHiqjWzRvcigAMwU03XSkdcs2bXoAQAWf0HFJlgnUHLuL10hqDEAVABZyRndH7IWAOlxyiWdz+HAVBRoRnJGYmWcYWlA+B8BapI/PmtvbIFZJ7gM0AawRr5eYkDRDbinZOZnLu1s9dAOJZXxxYARK5Z2cmxPOVmX2G9yaoYvxyA6DVrFQBICCKF4YVEANwohrrKfkoYFQDeyqp2gC4AeHXZ1gG8ga4CwHurma3i6oPj0hYwczViBMBbJBY3WAbAbAJn54/EyXq8iR5y3711VLx5pAHgDTQjgZX2mLG/84NYtHqzQLwDfmsARlU8+/MMwGba3CcXiAJ11SQFAK9Q1VTPJj5zfoaTVOolADKz/eZbjwcgYnGVRBfnM/T5Kgi8V9J3m592gCwAMoIJZQcwKQOAjANlOgDRwKLzALkqWaJzvFMOEA3Mc2icfUkryajzo1GdnMuEhi8BwLNT7/uC59uosREAUOALABQFzv93AAV+KgAVBzmUECgOrPF42uTM3sMARGwtslGrYJFvd54TuV1F4kkDoLL6j8Aq1oiIhpiDKrAwAMe9tCopKAEQyYyugXCBKQCigVnmsb0WvtMEUQQCwELjojGIItgKgKp2syi/w2UFwEUiAfBfkEwd5ADDOlw7oPocIADW5te0euVtoC0AxzUz2/JMijccVPUy2BqAhnl43JYEwONS6gvoL8Ko1K4kgeodAAAAAElFTkSuQmCC"},"1182":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAADVElEQVR4Xu2ZUW4aURAE8dlymJwph8nZEvGBtLLAsEuJVb0pf9rQ9HTXmwf469LP6AS+Rk/f8JcAGA5BAATA8ASGj98GCIDhCQwfvw0QAMMTGD5+GyAAhicwfPw2QAAMT2D4+G2AABiewPDx2wABMDyB4eO3AQJgeALDx28DBMDwBIaP3wYIgOEJDB+/DfAmAL8uv/9dJf5e/iizVJp+szPs6bfyAwCL1CO0LT8APL0hTlcp/xpGV8ABJOz3/nbkAAiAAwkMfsoKb/zaAAcBXq383gPsBGGlu/82uuo9wJkn8MzX3snprodrAfjkZ+9Vy1deAZ8u49Ovt+v4Ag9WbYDbvHu/iDl6d69evnID3IPg2T9i7gHwDIq9kAGH8RQJ5QbYswnuFflTud//9sn3GmcQoAbgGtiRMh89Z8qpX/KLoHsn9zbo9YrYrvxHp3zCnf99y+g3wKPrYDvoFoBXf3/GOj7jNZcB4Nl18NPfJ5585TeB756QyUU/ym6pDfAKIM8+/r2isdJjxgGwUnnELAFApCjWCABxeYT1ACBSFGsEgLg8wnoAECmKNQJAXB5hPQCIFMUaASAuj7AeAESKYo0AEJdHWA8AIkWxRgCIyyOsBwCRolgjAMTlEdYDgEhRrBEA4vII6wFApCjWCABxeYT1ACBSFGsEgLg8wnoAECmKNQJAXB5hPQCIFMUaASAuj7AeAESKYo0AEJdHWA8AIkWxRgCIyyOsBwCRolgjAMTlEdYDgEhRrBEA4vII6wFApCjWCABxeYT1ACBSFGsEgLg8wnoAECmKNQJAXB5hPQCIFMUaASAuj7AeAESKYo0AEJdHWA8AIkWxRgCIyyOsBwCRolgjAMTlEdYDgEhRrBEA4vII6wFApCjWCABxeYT1ACBSFGsEgLg8wnoAECmKNQJAXB5hPQCIFMUaASAuj7AeAESKYo0AEJdHWA8AIkWxRgCIyyOsBwCRolgjAMTlEdYDgEhRrBEA4vII6wFApCjWCABxeYT1ACBSFGsEgLg8wnoAECmKNQJAXB5hPQCIFMUaASAuj7AeAESKYo0AEJdHWA8AIkWxRgCIyyOsBwCRolgjAMTlEdYDgEhRrBEA4vII6wFApCjWCABxeYT1ACBSFGv8B6y3foENEs4iAAAAAElFTkSuQmCC"},"1183":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACNUlEQVR4Xu3bMXLCMBgFYfteNJychnvBmIEWqf73o1azq+U5mTjn4ZM2cKbpwR8CiEcgAAHEDcTxLYAA4gbi+BZAAHEDcXwLIIC4gTi+BRBA3EAc3wIIIG4gjm8BBBA3EMe3AAKIG4jjWwABxA3E8S2AAOIG4vgWQABxA3F8CyCAuIE4vgUQQNxAHN8CCCBuII5vAQQQNxDHtwACiBuI41sAAcQNxPEtgADiBuL4FkAAcQNxfAsggLiBOL4FEEDcQBzfAgggbiCObwEEEDcQx7cAAogbiONbAAHEDcTxLYAA4gbi+BZAAHEDcXwLIIC4gTi+BRBA3EAc3wIIYKaBx+v2up9PgS+ud6ygK4CLXQT/CxDAzAHcphoZwO/bbwHWHQhg7Wj0CQGMvt41nADWjkafEMDo613DjQ7Ar4DRANbYTvwMjFwA17tvQAD7rkaeFMDIa92HEsC+q5EnBTDyWvehBLDvauTJfAD19wYEEH9vQAACGPlo24aqvzmUXgAvjhyHAL5bUf3DkQAEsP24HHfQI8Aj4PPq+PXxCBj3/V4DWQALkP/nkfQPgeuNmH9CAPPv+C+hAAQQNxDHtwACiBuI41sAAcQNxPEtgADiBuL4FkAAcQNxfAsggLiBOL4FEEDcQBzfAgggbiCObwEEEDcQx7cAAogbiONbAAHEDcTxLYAA4gbi+BZAAHEDcXwLIIC4gTi+BRBA3EAc3wIIIG4gjm8BBBA3EMe3AAKIG4jjW4B4AG/hdFCBwjxZ2QAAAABJRU5ErkJggg=="},"1187":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACPElEQVR4Xu3ZMW7CUBQFUWhYSDYasVEWkobIRaQgAvZXujcntSnu/PEYnPPJX5rAOb3e+BMB4hIQgABxAvH5CkCAOIH4fAUgQJxAfL4CECBOID5fAQgQJxCfrwAEiBOIz1cAAsQJxOcrAAHiBOLzFYAAcQLx+QpAgDiB+HwFIECcQHy+AhAgTiA+XwEIECcQn68ABIgTiM9XAALECcTnKwAB4gTi8xWAAHEC8fm5AnxePu7Xr1tu9yvPcyAI8KgCATwCOgTc/c9nnSoAAcICOPy/S58pAAHCAjj819/zEgUgQFiA7fC3+V7+RB8B7v73P/PHPwIIEBZA/vdf8o0ugLufAP7zt+PA2AK4+/fv/u0KAhzjNPaqkQL48nfc17ECePFzTAICHOM09qpxAvjyt+YqAdZ4jbuaAOOOdG3QKAHkf+3wx70H+Pn5t47h8ROlXxCjCvDfgy9+ngDFU/+1mQAEiBOIz1cAAsQJxOcrAAHiBOLzFYAAcQLx+QpAgDiB+HwFIECcQHy+AhAgTiA+XwEIECcQn68ABIgTiM9XAALECcTnKwAB4gTi8xWAAHEC8fkKQIA4gfh8BSBAnEB8vgIQIE4gPl8BCBAnEJ+vAASIE4jPVwACxAnE5ysAAeIE4vMVgABxAvH5CkCAOIH4fAUgQJxAfL4CECBOID5fAQgQJxCfrwAEiBOIz1cAAsQJxOcrAAHiBOLzFYAAcQLx+QpAgDiB+HwFIECcQHy+AhAgTiA+XwEIECcQn/8N2dZkgX7/A6EAAAAASUVORK5CYII="},"1190":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAADF0lEQVR4Xu2YUUorURQE49pcjGtyMa5NCRIYYiaZUojcOuXva3x0deXMmJdTP6MJvIxuX/lTAgyXIAESYDiB4fW7AAkwnMDw+l2ABBhOYHj9LkACDCcwvH4XIAGGExhevwuQAMMJDK/fBUiA4QSG1+8CJMBwAsPrdwESYDiB4fW7AAkwnMDw+l2ABBhOYHj9LkAC+Am8nt4+Ly0/Tu9Jv5lcD2M7fhL8/LCPFeAixvSLMEaA89Db0XssfF8DtQDXI996HJwhTL4CWgFufcITYNA7wK1n/BEBpr0bLHEBfjPKXwWY8mhYSoCjo+y94O29E2zfAaa9HC4nwCMJrs/8vRe86ysx8TuDJQQ4j06e30e/8Nn7nXvfjRr/WlhGgMso90Sg5/vo7yJflq8myXICbMc4chUejXdUGuu1WFqAW4+G//wEHpXpkZTP/PflBXgmLOP/lQDGVUGnBACwjNEEMK4KOiUAgGWMJoBxVdApAQAsYzQBjKuCTgkAYBmjCWBcFXRKAADLGE0A46qgUwIAWMZoAhhXBZ0SAMAyRhPAuCrolAAAljGaAMZVQacEALCM0QQwrgo6JQCAZYwmgHFV0CkBACxjNAGMq4JOCQBgGaMJYFwVdEoAAMsYTQDjqqBTAgBYxmgCGFcFnRIAwDJGE8C4KuiUAACWMZoAxlVBpwQAsIzRBDCuCjolAIBljCaAcVXQKQEALGM0AYyrgk4JAGAZowlgXBV0SgAAyxhNAOOqoFMCAFjGaAIYVwWdEgDAMkYTwLgq6JQAAJYxmgDGVUGnBACwjNEEMK4KOiUAgGWMJoBxVdApAQAsYzQBjKuCTgkAYBmjCWBcFXRKAADLGE0A46qgUwIAWMZoAhhXBZ0SAMAyRhPAuCrolAAAljGaAMZVQacEALCM0QQwrgo6JQCAZYwmgHFV0CkBACxjNAGMq4JOCQBgGaMJYFwVdEoAAMsYTQDjqqBTAgBYxmgCGFcFnRIAwDJGE8C4KuiUAACWMZoAxlVBpwQAsIzRBDCuCjolAIBljCaAcVXQKQEALGM0AYyrgk5f4Ql1get3ogoAAAAASUVORK5CYII="},"1191":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAB+ElEQVR4Xu3YgQmAMADEQLunwziMeypiCzrDxQ3yDWlxbH30AoOmD35LAFyCBEgAfAEcvwIkAL4Ajl8BEgBfAMevAAmAL4DjV4AEwBfA8StAAuAL4PgVIAHwBXD8CpAA+AI4fgVIAHwBHL8CJAC+AI5fARIAXwDHrwAJgC+A41eABMAXwPErQALgC+D4FSAB8AVw/AqQAPgCOH4FSAB8ARy/AiQAvgCOXwESAF8Ax68ACYAvgONXgATAF8DxK0AC4Avg+BUgAfAFcPwKkAD4Ajh+BUgAfAEcvwIkAL4Ajl8BEgBfAMevAAmAL4DjV4AEwBfA8StAAuAL4Ph0Aa7jvMax0xvQ8I8ATwBkCRIgAdxLcBVArgBbgO/hJwAYgQR4D70CTPnVh2ACJADY/4ncIxC+Apb2+s8g9gpwu/cnTwDchARIAHwBHL8CJAC+AI5fARIAXwDHrwAJgC+A41eABMAXwPErQALgC+D4FSAB8AVw/AqQAPgCOH4FSAB8ARy/AiQAvgCOXwESAF8Ax68ACYAvgONXgATAF8DxK0AC4Avg+BUgAfAFcPwKkAD4Ajh+BUgAfAEcvwIkAL4Ajl8BEgBfAMevAAmAL4DjV4AEwBfA8StAAuAL4PgVIAHwBXD8CpAA+AI4fgVIAHwBHL8CJAC+AI5fAXABbj1UKIFbSw7lAAAAAElFTkSuQmCC"},"1195":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACxklEQVR4Xu2aUW6DMBAFydl6mJ6ph+nZGvGBhFCaNRuDvJ7pVyUD9nseT9Imj8UfdAMPdHrDLwIAh0AABADeADy+BhAAeAPw+BpAAOANwONrAAGANwCPrwEEAN4APL4GEAB4A/D4GkAA4A3A42sAAYA3AI+vAQQA3gA8vgYQAHgD8PgaQADgDcDjawABgDcAj68BBADeADy+BhAAeAPw+BpAAOANwONPYYCv5fvvuI+/y88U2a7ms3RJ28a/2ux1rBWCI0Ct9129OXc8vywA7zZ/LS4a38o9XreHgQBCOQBaN7YVgv9McWaeO07qVXOUAiCzKdFLQcv4Wv6sNigHwNmNeLfB0ebvT10GvqtObc/nlgIgE7wXANtLylkAM2u+856pAYhOeDT+aiNmM4EAJP5fMBMEApAAoPUvjDtVnp1LAJIAzAKBAHwAQPbUjXSfAAjASDz2XUv0Lj8a77uaMZ+mATTAmGT2WFV0wqPxHmsY/RkaQAOMzmh+fdEJj8bzM9e5UwNogDq0nl1pdMKj8bPzVbxeA2iAity2rTk64dF42yy1r8IaYKZP9D5BEAUA7QufLWBMDcD+E7v199m+zdOywdE10wMQFUAfFwA4AQIgAPAG4PE1gADAG4DH1wACAG8AHl8DCAC8AXh8DSAA8Abg8TWAAMAbgMfXAAIAbwAeXwMIALwBeHwNIADwBuDxNYAAwBuAx9cAAgBvAB5fAwgAvAF4fA0gAPAG4PE1gADAG4DH1wACAG8AHl8DCAC8AXh8DSAA8Abg8TWAAMAbgMfXAAIAbwAeXwMIALwBeHwNIADwBuDxNYAAwBuAx9cAAgBvAB5fAwgAvAF4fA0gAPAG4PE1gADAG4DH1wACAG8AHl8DCAC8AXh8DSAA8Abg8TWAAMAbgMfXAAIAbwAeXwMIALwBeHwNIADwBuDxNYAAwBuAx38Cdsa6gQQID/gAAAAASUVORK5CYII="},"1205":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAB7ElEQVR4Xu3YQREAIBDDwEMbYvCvAGawkcXBkTzarj3njpf9gUWALPt/OAHa/AkQ508AAgiBaQdkgDR+ITCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/gJQAA7QNsBGaDNXw2M8ycAAewAaQdkgDR+NTCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/gJQAA7QNsBGaDNXw2M8ycAAewAaQdkgDR+NTCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/gJQAA7QNsBGaDNXw2M8ycAAewAaQdkgDR+NTCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/gJQAA7QNsBGaDNXw2M8ycAAewAaQdkgDR+NTCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/gJQAA7QNsBGaDNXw2M8ycAAewAaQdkgDR+NTCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/gJQAA7QNsBGaDNXw2M8ycAAewAaQdkgDR+NTCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/gJQAA7QNsBGaDNXw2M8ycAAewAaQdkgDR+NTCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/hnHj5h1QEoiO32AAAAAElFTkSuQmCC"},"1206":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAEXElEQVR4Xu2c63HcMAwG7WrTQkpwC642GXlO47MsHUGKIF6bv6YpCbv8AN158v7Gv9IVeC/99Dz8GwIUlwABEKB4BYo/PgmAAMUrUPzxSQAEKF6B4o9PAlwJ8Pfz3+mPPv6kqlmqh7l9mK+gn22cRAQE6IH+LAIC3D5vthuMgk8mQc0EmAF/FyF4EtQSYCb4JElQQwAt8AlSIL8A2vA3CQK3gdwCrIAfPAVyCrASPALYvs2dXh0BxFDyJYAF/MBzQC4BrOAjgDhx9BZawkcAPa6ina3hI4AI0/xFHsDzFjCfa3NHT+ADn/7t1uMNgd7gI0DzvM5bAPx5tXzs5CcBPMKVlDvw9wD2LSAq9CRfBdsKkAF+8P5vI0AW8MFf//bbXzsDZINPAkimpMeajPARQChAVvgIIBAgM/zj4wd8JdSfASoJEPD1UFeAqvCvgtFhQiCAoItNX+JIBD0BOP2vvXEiAQJMP96dGxqLgACdvFSWG0qAACpEBzY1kkBPgK0GzAF9JhhIgAB9iHRXI4Bufd3vnk4A2kC/c4sl0G0BCIAAXxVgGJSLkC4B9kdHApkEaQUgCRCAdiBwIHUC0A7cfUGk/xZw9cjMBL8rs/j0bzdgJwAzwU8BDODbC4AE5v/FnG0CVJ8JjE79c/QggGAwV1uCAI/SVhwIHcD3MQNUnAOcwPcjQCUJHMFHALXm/mJjBLgoTpU5AAEKC+AMPi1gdQtAAE7/auda1+ODoFaFZv3c4en30QKqDH9btR1KYJsAleAjwCFLq8FHAAT4qoCzNmDTAiqe/uMw6USE9QIA/1sFBxKsFQD4P3MAAWa9ZAfdp5QAnP5zS40lWNcCEKCwAMC/7lHpEwD4rweU1AIAXzadGkqgOwMgQGEBgO8evu7XwQiAALIKFF9l2P9JAGv3jOHnFWAvrOc25AB+PgGORUWAZsbleQ28OlGjEmz7jf5us+x+/jAkhwCv4nQUolYbcRL9u6PxBWgV9K4AW6VG93hOgtZ9SlJDYY2uALOKd/XgkqKOwpvZUiT3qQBXsqW+AFoSSIs6IsCsvaX7SEgprVkjwEwJeouqKcARyvO1eu9TCXBr23UC7HcyAmT/3ZGijlxv5DqtSjv9+XoBRtLgDhAEeKmejQA9EtyB33OdABO7RojYCSBpCXfhI0DTGXsBmrd4cwEtwGkLuMlV/OsIgABiWbaFM9pO1wVtF+duAZz+pl0IcCwRCdCUJs4CEqDJigQgAZqSxF1AAjTZkQAkQFOSuAtIgCY7EoAEaEoSd8FIAhT7MChvAozC33Uv8nlATgHuwn/OvOQi5BJgJvgiEuQQQAt8gQExtgCrwCcWIaYAVuDP3oeCzwixBPAEPsmMEEMAr+ATtAbfAkQBHzgNfAoQEXzQNPAlQAbwwdLAjwDZ4Af5SNmHAFnhB/hiyV6AzPADpICtABXgO58JbASoBt6xBOsFqAzfoQhrBQD+twJOvkNYJwDwz/+0zliE/6dzm5BiYJEsAAAAAElFTkSuQmCC"},"1209":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC+UlEQVR4Xu2YMU7DUBQEkxvQU3L/I1HScwNQCkvWl4PjhJW8f4Yygaf3Zicbi+vFHzSBK/p6j78oAFwCBVAAOAH4+TaAAsAJwM+3ARQATgB+vg2gAHAC8PNtAAWAE4CfbwMoAJwA/HwbQAHgBODn2wAKACcAP98GUAA4Afj5NoACwAnAz7cBFABOAH6+DaAAcALw820ABYATgJ9vAygAnAD8fBtAAeAE4OfbAAoAJwA/3wZQADgB+Pk2gALACcDPtwEUAE4Afr4NoABwAvDzbQAFgBOAn28DKACcAPx8G0AB4ATg59sACgAnAD/fBlAAOAH4+TaAAsAJwM+3ARQATgB+vg2gAHAC8PNtAAWAE4CfbwMoAJwA/HwbQAHgBODn2wAKACcAP98GUAA4Afj5NoACwAnAz5++Ad7fPn6OZvz1/Tk9l4XJlIeuQ1/CXF4bw729vvXaWpqZhZhGgPGTvhXaGPY9KZbw994/2ixn/P0pBBiDWgd99CtgLc4yZ2YR6gXYCueRNtj6ND4i0mxfB1MIMH5qb+E+G9RagqNfGWes+L2d6gW4HThW/rPhj9/9WyJtPTTuQT7z+9MIsEB+Nfy9B0AFOKHOqYe0e88X/yXZGVBO1QCJYP56JjhDgK/uMIUAr0LY+/utfyzt/U3L+wrQklRoTwUIgW0ZqwAtSYX2VIAQ2JaxCtCSVGhPBQiBbRmrAC1JhfZUgBDYlrEK0JJUaE8FCIFtGasALUmF9lSAENiWsQrQklRoTwUIgW0ZqwAtSYX2VIAQ2JaxCtCSVGhPBQiBbRmrAC1JhfZUgBDYlrEK0JJUaE8FCIFtGasALUmF9lSAENiWsQrQklRoTwUIgW0ZqwAtSYX2VIAQ2JaxCtCSVGhPBQiBbRmrAC1JhfZUgBDYlrEK0JJUaE8FCIFtGasALUmF9lSAENiWsQrQklRoTwUIgW0ZqwAtSYX2VIAQ2JaxCtCSVGhPBQiBbRmrAC1JhfZUgBDYlrEK0JJUaE8FCIFtGfsLPo6Ygegu9PUAAAAASUVORK5CYII="},"1211":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAADMklEQVR4Xu2cUW5aQRAE4US5/zFyIkeJhGRZJoC8S9V7U/6G7Z7uesPCh6+X/kYncB09fcNfAmA4BAEQAMMTGD5+GyAAhicwfPw2QAAMT2D4+G2AABiewPDx2wABMDyB4eO3AQJgeALDx28DBMDwBIaP3wYIgOEJDB+/DRAAwxMYPn4bIACGJzB8/DZAAAxPYPj4bYAAGJ7A8PHbAAEwPIHh47cBAmB4AsPHbwMEwPAEho/fBgiA4yfw8fvy8XeK66/+38GrbR5+A9zK3wHAzrNfLWrX6wPgTrKfy7+95IwbJgACYNdy2X/u16d05RPaBtjf348Udhb03dk77hg/CmDRmw/7EUAAcEYIDgnA7if03vlnvAweDoD/lbPqDvAIgDNtgkMB8KiYdwJwFggOAcCj4lev5mf1zgCBHgCiDEJz0aX+5WMC4IUfgu6lu+qj5+X2FrwhAAJgAUabj3hmJa9+Cp/RXH332Bzjt8frN8DN9Tu+/n1N6FkIVsP3ThAOA8A7Q/ms9QiCI5f/71sMFWy6jgQCwNED5iIAsOgdwgHg6AFzEQBY9A7hAHD0gLkIACx6h3AAOHrAXAQAFr1DOAAcPWAuAgCL3iEcAI4eMBcBgEXvEA4ARw+YiwDAoncIB4CjB8xFAGDRO4QDwNED5iIAsOgdwgHg6AFzEQBY9A7hAHD0gLkIACx6h3AAOHrAXAQAFr1DOAAcPWAuAgCL3iEcAI4eMBcBgEXvEA4ARw+YiwDAoncIB4CjB8xFAGDRO4QDwNED5iIAsOgdwgHg6AFzEQBY9A7hAHD0gLkIACx6h3AAOHrAXAQAFr1DOAAcPWAuAgCL3iEcAI4eMBcBgEXvEA4ARw+YiwDAoncIB4CjB8xFAGDRO4QDwNED5iIAsOgdwgHg6AFzEQBY9A7hAHD0gLkIACx6h3AAOHrAXAQAFr1DOAAcPWAuAgCL3iEcAI4eMBcBgEXvEA4ARw+YiwDAoncIB4CjB8xFAGDRO4QDwNED5iIAsOgdwgHg6AFzEQBY9A7hAHD0gLkIACx6h3AAOHrAXAQAFr1DOAAcPWAuAgCL3iEcAI4eMBcBgEXvEP4DiGJggeXE8vcAAAAASUVORK5CYII="},"1212":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC3UlEQVR4Xu2aUW5aQQADyW16pZ4wV+ptWhGJKq1Cdp7ylfHwbSRsz3rhiZdbr+kEXqbdZ/4WAOMQBEAAjCcwbr8FCIDxBMbttwABMJ7AuP0WIADGExi33wIEwHgC4/ZbgAAYT2DcfgsQAOMJjNtvAQJgPIFx+y1AAIwnMG6/BQiA8QTG7bcAATCewLj9FiAAxhMYt98CBMB4AuP2W4AAGE9g3H4LEADjCYzbbwECYDyBcfstQACMJzBuf2MBfvz8ffv1uuH1ItAboQTAUywC4OKJscn9AHT6P2U2AGxH+qIfNwCd/iMOAXCMyC0IAHe/R3cBcIzILQgAd79HdwFwjMgtCAB3v0d3AXCMyC0IAHe/R3cB8D6iwQdHARAAx5X4voKrJ/qq/vsm8/eTtwCPKAbLv1sPgAAQ7NgzC/RU33X31+DfxlqAe/EUFOFZcQNAyw0AIdr0bh8u3/8l8LQAw3f/43xsXwHjp39jAZ6tQKf/bQT8C/AZAIM/+/7/trcJQNM/8ij4o18Clf/PCGwswOMaeFhv+scW4D0AlT+6AOJnXV+xtnMFfCUl8XsDQFwusRYAJCWxJgDE5RJrAUBSEmsCQFwusRYAJCWxJgDE5RJrAUBSEmsCQFwusRYAJCWxJgDE5RJrAUBSEmsCQFwusRYAJCWxJgDE5RJrAUBSEmsCQFwusRYAJCWxJgDE5RJrAUBSEmsCQFwusRYAJCWxJgDE5RJrAUBSEmsCQFwusRYAJCWxJgDE5RJrAUBSEmsCQFwusRYAJCWxJgDE5RJrAUBSEmsCQFwusRYAJCWxJgDE5RJrAUBSEmsCQFwusRYAJCWxJgDE5RJrAUBSEmsCQFwusRYAJCWxJgDE5RJrAUBSEmsCQFwusRYAJCWxJgDE5RJrAUBSEmsCQFwusRYAJCWxJgDE5RJrAUBSEmsCQFwusRYAJCWxJgDE5RJrAUBSEmsCQFwusRYAJCWx5g8ZD4qB2m0tbAAAAABJRU5ErkJggg=="},"1214":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAADwElEQVR4Xu2bS24jMQxE43tlk5PPZu7lwMgY4/gryZJIVj2vpe4m67FICfDhg591Bg7W0RP8BwCYQwAAAGCeAfPwcQAAMM+Aefg4AACYZ8A8fBwAAMwzYB4+DgAA5hkwDx8HAADzDJiHjwMAgHkGzMPHAQDAPAPm4eMAAKCZgT/Hz2NPZF+Hv5bFUDLoXnF7QIhcGwFhOgBUxW0Byw4AZ7GvgYgQ//QN2xwAsZ97gAwACN1i9rdrAGAsbzK7AEBGyrFAAGAsbzK7ZAA4KcIc0MdllPjLTgEAYA4ALtAOQGT1L3MAAAAA5oBGBnCAxkQpLosWnxYQTJU0AMwBr+kCgNc5kl2RQfylLeCsHHcC9xkGANnabgsMANryJLvKBgCGwVuGs4i/ZQYAgN8AZBIfAAIajCUAuMB/0mwBAIIfCKwBcIcgm/jbZoDrVut6OQQA/0gAgIDp88Ert/0x5PL9AGAOgOMskNH+w2YANwCyih8KgAsEmcUHgMWtOLv4AAAA+/4efi/XyqeBCtUf7gDKcwAANNqrogtUER8HaIS0Z1kl8VMAoNYGAKCnXC7WKrSCauKncYAzB5UhqCg+AAy61fW2quKnA6DiPFBZfAB40wGqi58SgEouAABvVtCz7dkHQgXx0zpABRcAgIXVn/1YqCJ+agfICoGS+ADQ6WJq4pcAIMs8oCg+AHQ4AAB0JGvF0shjoar4ZRwgug0AwIqS7nwmDtCZsMblIX8Na/y2m2UREChXf6kWEHUvAACj5bpo324XAIBFQr7z2F0QqItfsgXsOhE4iF8WgB0QAMA7Hr1p76pW4CJ+aQdY6QIAsKmCZ7xmhQsAwAxlNj5jNgQAsFG8Ga8CgPEslroKfhQmAADAcTwF93e6tAEc4AE5ADC7pBY+b3YLOH0qACwUbMWjZ0MAACtUWvhMABhLrsQMsOJWEAcYAyps12wHcJkDZBwAFxirPQB4kjeHNgAAADBmHRl3zZ4DcICMKj/5JgDoF4wWQAvopybzjpkuQAvIrPSDb5sJgMNdgFQL4C6gv2IB4EXO1NsAAABAv21k3sEM0KcODoAD9BGTffVsB1A/CeAADUQrD4JSAKyofhygoUIyLFkl/jk2VReQcIDV4itDAACd9qXmBOUB2FX9l5woQVAWgAjhFSEoCUC0+EozQTkAsoivAkEpALKJrwBBCQCyCn99gKg4HKYGoIrwlUFIC0BV8au1hZQAVBe/0nExHQBK4lcAIQ0AqsJnnw9SAOAifkZHCAXAUfhsEIQB4C5+ltbwDUgesJAQ68DMAAAAAElFTkSuQmCC"},"1215":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACRklEQVR4Xu3Wu03EQAAG4b0OyAnpvyRC8usA5MCSsfy49HY+MoQDZnb8ex/DT9rAI00PfgggHoEABBA3EMe3AAKIG4jjWwABxA3E8S2AAOIG4vgWQABxA3F8CyCAuIE4vgUQQNxAHN8CCCBuII5vAQQQNxDHtwACiBuI41sAAcQNxPEtgADiBuL4FkAAcxv4/Pj6XQh/nt9iPzjq6aXsAxDE/woEMMYoRyEAAcx7B1jf7PUOsP99JbcAkzawPdjt4e8vhUfPVS6NU38C9oe+7Xw94LNnBDDBKtwFcPf3CRTcIky9AAv91T1gtbO87VefiFuLb/zA9AHsz+bsoM8uiG98ti/96+kAKt/5qxJyAbz0WoQeEkDosI9QBSCAuIE4vgUQQNxAHN8CCCBuII5vAQQQNxDHtwACiBuI41sAAcQNxPEtgADiBuL4FkAAcQNxfAsggLiBOL4FEEDcQBzfAgggbiCObwEEEDcQx7cAAogbiONbAAHEDcTxLYAA4gbi+BZAAHEDcXwLIIC4gTi+BRBA3EAc3wIIIG4gjm8BBBA3EMe3AAKIG4jjWwABxA3E8S2AAOIG4vgWQABxA3F8CyCAuIE4vgUQQNxAHN8CCCBuII5vAQQQNxDHtwACiBuI41sAAcQNxPEtgADiBuL4FkAAcQNxfAsggLiBOL4FEEDcQBzfAgggbiCObwEEEDcQx7cAAogbiONbAAHEDcTxLYAA4gbi+BZAAHEDcXwLIIC4gTi+BRBA3EAc3wIIIG4gjm8B4gH8AXKWaIE7NOrGAAAAAElFTkSuQmCC"},"1216":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACAUlEQVR4Xu3YwQ2DMBjF4D979dLJuXQvEEWReugG/tjAL64DXeNJL7DS9OCHAHEJCECA+AJxfAUgQHyBOL4CECC+QBxfAQgQXyCOrwAEiC8Qx1cAAsQXiOMrAAHiC8TxFYAA8QXi+ApAgPgCcXwFIEB8gTi+AhAgvkAcXwEIEF8gjq8ABIgvEMdXAALEF4jjKwAB4gvE8RWAAPEF4vgKQID4AnF8BSBAfIE4vgIQIL5AHF8BCBBfII6vAASILxDHVwACxBeI4ysAAeILxPEVgADxBeL4CkCA+AJxfAUgQHyBOL4CECC+QBxfAQgQXyCOrwAEiC8Qx1cAArQXOM7X+V6f7A8hC761J0A7AHMLcE9QrYACEKCbgP3rV4CoAwSYSV8BBAgL8Hv4roDgFUCA59CzVwABCPD9/t+P/wHC10D18NNXQND3v8jZdwACxN8BCEAADpQ/A52+AnBAATjgKyDuAAEIEF8gjq8ABIgvEMdXAALEF4jjKwAB4gvE8RWAAPEF4vgKQID4AnF8BSBAfIE4vgIQIL5AHF8BCBBfII6vAASILxDHVwACxBeI4ysAAeILxPEVgADxBeL4CkCA+AJxfAUgQHyBOL4CECC+QBxfAQgQXyCOrwAEiC8Qx1cAAsQXiOMrAAHiC8TxFYAA8QXi+ApAgPgCcXwFIEB8gTj+BQ82MIEvNWAaAAAAAElFTkSuQmCC"},"1217":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACq0lEQVR4Xu2Y0U0CARQEoQQrsAn7r8AmrIASNPdxiSEcEblkjjfjpzEsuzP3VM6nvtQLnNXtK39KALkECZAA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF6/C5AA8gXk9bsACSBfQF5fdwE+3t6/bzH/vHzptlh2GF/6GvgW6PXnbCKMFeA3+Eeg2kQYKcCzEP8rzyv+OTFWgEee+i1wiwh7vM6RxRgnwLNP/zWs6RIkwJ3Hc2+ZjngJxgmwjLwHuD1e44jAr9/TSAHWkn/9F/DW2V++N/33v+JzgC0Z7j2dBvBr/9EX4BVOMP0eE4AmAOcnAAyAjk8AmgCcnwAwADo+AWgCcH4CwADo+ASgCcD5CQADoOMTgCYA5ycADICOTwCaAJyfADAAOj4BaAJwfgLAAOj4BKAJwPkJAAOg4xOAJgDnJwAMgI5PAJoAnJ8AMAA6PgFoAnB+AsAA6PgEoAnA+QkAA6DjE4AmAOcnAAyAjk8AmgCcnwAwADo+AWgCcH4CwADo+ASgCcD5CQADoOMTgCYA5ycADICOTwCaAJyfADAAOj4BaAJwfgLAAOj4BKAJwPkJAAOg4xOAJgDnJwAMgI5PAJoAnJ8AMAA6PgFoAnB+AsAA6PgfbL5IgZ7xcaMAAAAASUVORK5CYII="},"1218":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACTklEQVR4Xu3ZwU3DQAAF0aQEeuBE/7VwogdKAOWAxAlsa7XR7jzOjpOZHX1b4n7zlzZwT9ODvwkgHoEABBA3EMe3AAKIG4jjWwABxA3E8S2AAOIG4vgWQABxA3F8CyCAuIE4vgUQQNxAHN8CCCBuII5vAQQQNxDHtwACiBuI41sAAcQNxPEtgADiBuL4FkAAcQNxfAsggLiBOL4FEEDcQBzfAgggbiCObwEEEDcQx7cAAogbiONbAAHEDcTxLYAA4gbi+BZAAHEDcXwLIIC4gTi+BRBA3EAc3wIIIG4gjm8BBBA3EMe3AAKIG4jjW4CTAby/vny9fXxu420bkJPneOnyx+E/PiiAS/rW/tDP4Qtg7XO8/Ot/B7BTBB4BB5MQwEFRsy6b/TImgFkne/B7BHBQ1D+XLfsImP1G7iVwTHBD7vKsw5i9OkNk7bgAzwpgxoHM/o4lHwECGJfJcgHs+jY+7kjP3UkA53xtd/VyATxOwCNgXIdLB7DTP2XGHem5Oy0ZwDlEV/9lQADxPgQggLiBOL4FEEDcQBzfAgggbiCObwEEEDcQx7cAAogbiONbAAHEDcTxLYAA4gbi+BZAAHEDcXwLIIC4gTi+BRBA3EAc3wIIIG4gjm8BBBA3EMe3AAKIG4jjWwABxA3E8S2AAOIG4vgWQABxA3F8CyCAuIE4vgUQQNxAHN8CCCBuII5vAQQQNxDHtwACiBuI41sAAcQNxPEtgADiBuL4FkAAcQNxfAsggLiBOL4FEEDcQBzfAgggbiCObwEEEDcQx/8GKIFMgeU61QEAAAAASUVORK5CYII="},"1219":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACDElEQVR4Xu3UsRXCMBTFULIQPXMxB3PRsxCcFLTQfWJ0s4AjWX7byZc2sKXpwZ8EEI9AAAKIG4jjWwABxA3E8S2AAOIG4vgWQABxA3F8CyCAuIE4vgUQQNxAHN8CCCBuII5vAQQQNxDHtwACiBuI41sAAcQNxPEtgADiBuL4FkAAcQNxfAsggLiBOL4FEEDcQBzfAgggbiCObwEEEDcQx7cAAogbiONbAAHEDcTxLYAA4gbi+BZAAHEDcfzlFuB6OT/3O7vdH8v9+xFbW0ri+/LfIqci+OfoBPDlWf4quqm1WCqAXcr0axTAVIoHPmc6ukkVyy3ApJzCWQIo3PIHRgEIIG4gjm8BBBA3EMe3AAKIG4jjWwABxA3E8S2AAOIG4vgWQABxA3F8CyCAuIE4vgUQQNxAHN8CCCBuII5vAQQQNxDHtwACiBuI41sAAcQNxPEtgADiBuL4FkAAcQNxfAsggLiBOL4FEEDcQBzfAgggbiCObwEEEDcQx7cAAogbiONbAAHEDcTxLYAA4gbi+BZAAHEDcXwLIIC4gTi+BRBA3EAc3wIIIG4gjm8BBBA3EMe3AAKIG4jjWwABxA3E8S2AAOIG4vgWQABxA3F8CyCAuIE4vgUQQNxAHN8CCCBuII5vAQQQNxDHtwACiBuI41sAAcQNxPEtgADiBuL4FkAAcQNxfAsggLiBOP4LHCEgge9Ko7wAAAAASUVORK5CYII="},"1221":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAB60lEQVR4Xu3YQREAIBDDwMM1VlALM9jI4uBIHm3X7HPHy/7AIkCW/T+cAG3+BIjzJwABhMC0AzJAGr8QGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/AQggB2g7YAM0OavBsb5E4AAdoC0AzJAGr8aGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/AQggB2g7YAM0OavBsb5E4AAdoC0AzJAGr8aGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/AQggB2g7YAM0OavBsb5E4AAdoC0AzJAGr8aGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/AQggB2g7YAM0OavBsb5E4AAdoC0AzJAGr8aGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/AQggB2g7YAM0OavBsb5E4AAdoC0AzJAGr8aGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/AQggB2g7YAM0OavBsb5E4AAdoC0AzJAGr8aGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/AQggB2g7YAM0OavBsb5E4AAdoC0AzJAGr8aGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/DMPnLAIkPUqjQAAAAAASUVORK5CYII="},"1223":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAEGklEQVR4Xu2d0ZHbMAxEfR2kkusuVaS7VJIOcqNJPKNkbBEgAAoA3/0apMjdxyUl+cYfD/62VuBj69kz+QcAbA4BAABAfwW+/fz+WzLLX58/tlsQLSYsNXgEAQCMFEr6OQDMG0MCnLQjAeZBurUlCTAvPwlAAszTk6UlCTDvRPkE8DL/kJAzwDxI5pZnI89GeBo8GiQAjBQK+nylyVdTAIAgg0fdAsBIobjPbz8DZDHfQ+KKCQIAHs7/7QMAJsQkASZEc2xCAjiKSQJMiEkCTIjm2IQEcBSTBFCK2Wn1P6deDYJbEwAAlCsmoBwAnEUlARSCkgAKsYJKSQBnYUkAhaAkgEKsoFISwFlYEmAgaMdVf54yADwej+4md/pOgfsWsLP5BxjbJ8DuAFSDgARwPgRuDQCr/w9NlbYB1wQAAAAQ/Rt2QOqm6bLS6j9EIwGc0QEAZ0GrdQcA1RxzHi8AOAtasbtKEHAGCCAMAAJErdQlAFRyK2isVSBgCwgCYLbb1eAAwKxTQe0AIEjYKt0CQBWngsYJAEHCVukWAKo4FTDO1ebzMijAREuXpQHguwAW6+/7HoHrbaBEAkB5r1LpBJCYf9QAwOYAAAEAkAJvGNhiCyABSAASgASQ/YiT9GDZpY4toIuTk/MAgEnhujQDgC5OTs4DACaF69IMALo4KZjHHWa/GtbydwG7PgfIYvj/ENwCgGCBtHtWAAAS10813V4aAQAApEzblIPqeE4gAUiAlIst5aBIAOVqMZSnBKDbAfDwhy1AQSkAKMQylqZMAMmcqkFCAkhcVdQAgEKsi1ISwEfHYS8kwFAiXQEJoNPrXTUJ4KPjsBcSYCiRroAE0OlFAvjoNd0LCTAt3euGlRIgq/mHspwBnME8d5fZ+Oc4ywKw+n3B08xXyVPB6HZngCcAh/hR20FlY6XBVjoBJJO0wAEAEoWT1wDAtUEkwIU+JEDy1S0ZHglAAph+x6h7CrAFDGIEACQ5m7jGsgUc0wKAxOaOhmY1HwBGChf43AoBCVDA5KshAgB3AdwFXDDAXQB3Afkz3hrjlhlyBrCoZ2h7p+nV3ukbZM77hRAAsNgqb5v2DJAFALmU/1ZW2ToAYNbhJodHAACAIAUM3VaP/0qPkFMmAAAYVo+yKQAoBZOWcwiUKvWijgQwiKdsSgIoBZOWkwBSpUgAg1L2piSAXcOXPZAABmE5AxjEUzYlAZSCSctJAKlSnAEMStmb3pYAHWJeIn/2JFgKwC6mX4EhAeKsk6ReAuK7GgCwqLegLQAsEDnzJQAgszsLxgYAC0TOfAkAyOzOgrEBwAKRM18CADK7s2BsALBA5MyXSA0AD3bi0QGAeI1TXwEAUtsTPzgAiNc49RUAILU98YMDgHiNU18BAFLbEz+4aAC+AA+SAJ/AAVbwAAAAAElFTkSuQmCC"},"1225":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACcElEQVR4Xu3aMU5jARAEUftem+zJSfZeIAcrkeAJyLoe8Qipuov+/sDz4SudwDNND/5BgLgEBCBAPIE4vgUgQDyBOL4FIEA8gTi+BSBAPIE4vgUgQDyBOL4FIEA8gTi+BSBAPIE4vgUgQDyBOL4FIEA8gTi+BSBAPIE4vgUgQDyBOL4FIEA8gTi+BSBAPIE4vgUgQDyBOL4FIEA8gTi+BSBAPIE4vgUgQDyBOL4FIEA8gTi+BSBAPIE4vgUgQDyBOL4FIEA8gTi+BSBAPIE4vgUgQDyBOL4FIEA8gTi+BSBAPIE4vgUgQDyBOL4FIEA8gTi+BSBAPIE4vgUgQDyBOL4FIEA8gTi+BSBAN4GPzz+fL/q/z3/ZH4Qs+Kt4AjweBLAAHgEeAUEH/s+/zwDB8r8//wlAAG8BUQe8BTzibwFV8b9zp18DCWAB8g5YgLgCBCDAfgKvX/qUf9v3ruHEAhDgZwXmBfAXv/cLT4D9J+BbQgIQYDsBjwCPgPy/faXfAixAfAG2H3C/p5v/EPj7iLa/AwG2+z3pCHBGtH1AgO1+TzoCnBFtHxBgu9+TjgBnRNsHBNju96QjwBnR9gEBtvs96QhwRrR9QIDtfk86ApwRbR8QYLvfk44AZ0TbBwTY7vekI8AZ0fYBAbb7PekIcEa0fUCA7X5POgKcEW0fEGC735OOAGdE2wcE2O73pCPAGdH2AQG2+z3pCHBGtH1AgO1+TzoCnBFtHxBgu9+TjgBnRNsHBNju96QjwBnR9gEBtvs96QhwRrR9QIDtfk86ApwRbR8QYLvfk44AZ0TbBwTY7vekI8AZ0fYBAbb7Pem+AB9QQIEX6LS6AAAAAElFTkSuQmCC"},"1226":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACfUlEQVR4Xu3Y200CUQAGYSjBCmzC/iuwCSuwBM0+bLIhQLIHBDzf+GQiIP/snOFyPPRDEzjS6xt/SABcggRIAJwAPr8CJABOAJ9fARIAJ4DPrwAJgBPA51eABMAJ4PMrQALgBPD5FSABcAL4/AqQADgBfH4FSACcAD6/AiQATgCfXwESACeAz68ACYATwOdXgATACeDzK0AC4ATw+RUgAXAC+PwKkAA4AXx+BUgAnAA+vwIkAE4An18BEgAngM+vAAmAE8DnV4AEwAng8ytAAuAE8PkVIAFwAvj8CpAAOAF8fgVIAJwAPr8CJABOAJ9fARIAJ4DPrwAJgBPA51eABMAJ4PMrwAUBPt7ef5Y/fX5/Tc1o6nG3Hu5FggS4leKD7v9XJ3Z2CaYqwL0luPfjPegs7Po3UwmwLB89sevF3r7ujz7Wrivw5BtPJcDoid3ebytCbwKfbOfefz96Ykfvt/f5veLtpyvA8q79XM6vwR8txyte0L3PaToBVgCrCOc+xp078WoFphLg1P7Tk33t9T0B9rbjn9x+e2FPf99OmP0Ln0uXiynAudd59dRvZaAEUE/5tVhPLcD6xZDweX70FXl6AUbBKPdLAOVKX9iZAAmAE8DnV4AEwAng8ytAAuAE8PkVIAFwAvj8CpAAOAF8fgVIAJwAPr8CJABOAJ9fARIAJ4DPrwAJgBPA51eABMAJ4PMrQALgBPD5FSABcAL4/AqQADgBfH4FSACcAD6/AiQATgCfXwESACeAz68ACYATwOdXgATACeDzK0AC4ATw+RUgAXAC+PwKkAA4AXx+BUgAnAA+vwIkAE4An18BEgAngM+vAAmAE8DnVwBcgF/WhISBCbl47wAAAABJRU5ErkJggg=="},"1227":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAEk0lEQVR4Xu2cYZLVMAyDd0/LFTgCV+C0MG+gM91dqJw2cuxI/H1pEktf5LQwvL/5j7QC79LVu/g3AyAOgQEwAOIKiJfvBDAA4gqIl+8EMADiCoiX7wQwAOIKiJfvBDAA4gqIl+8EMADiCoiX7wQwAOIKiJfvBDAA4gqIl+8EMADiCoiX7wQwAOIKiJfvBDAA4gqIl+8EMADiCoiX7wQwAOIKiJfvBDAA4gqIl+8EMADiCoiX7wQwAOIKiJfvBDAA4gqIl+8EMADiCoiX7wQwAOIKiJfvBDAA4gqIl+8EMADiCoiX7wQwAM0U+P7z14cd//hmiB9Y2Eu8z+YfhWdAcKydsdYDQ0cf7QPA/8zPgmAlfKOuDozfB4BX0azTuRq+AUNHhxqAiGIGIKIScQwygN0GIuuz0oco62vqHgmw2oDV6xMhqA9ABfEr7IEEQX8AMqI3AgDzEkoyv0cLuBI/w/yXSgaAiCCaGomfAQHaA/sSijR68LtbABIvar5bAFLywe/IBGYKoLXPZTH38UC+q0frJ0CkBzOFNwAk9EanRUawIEDrNu7/Pd4CzqCseCMwAKNHlTjeAEwXt8cd4Ci7KgCs9jPd7q8T7gEA04BIC2CuT4bAAFwJvLn5vS6Bjn9KFvRJgBX/JMsJQIFufNIVp3/1B6hxlW49UT8B0ClkXsBWrn3LzvGHegPANH/lq+e4j7efMABIus1ToC8AGadf4B5QG4BVl7/o3z80/4ug+t8BDABqUI9/dwJEJET3gNccWS0pst+BMX0ByBYdQWAABrCLDkWiZ0JQaS9R/QLjeidAJgCbfheoDUDkNSwbggoX08DJjg6pD0AEgsz+awCibE0eV0V4dBfIhHGCxD0SoEoKIPOz25EUAAgC9snb0Pz6XwI/E76qDUTMb3j69wKAaYABmNBsZkyBjGC0AbTmuS7G+jN0u5hjn0sgIwE2N79PC4gYwTh9kXUZ4JFP/Xn6+gmw0oTI2gzwDMBfBSIGHGLNNiKy9uw1E40/lqqbABEDWOajbw7MdZMh6A8A6xQiAFnrGoCB/5WLeQEzAMkonpdD4mdEMNqDE4AICBKfefKPstAeDIABICqQNnXNSyA6fW4B0wAxAFdSIhA3aAO9AWDfBQzAtKQZnwiJX6ENsAEcV234iZoJEP0Sx4agAoTDlo49UBcAQzDm5M3RtQEYgYB5Ids4CeoDYAhunu3YYwYgptOfUZEkYCbRyF6DY3sAUEn8zSDoA0AVCCIANHo9NADBqPwwLAJBk1ZgAAzAHQUWPVPl5FXZxwQb9kqAjNiNmO87wAQ0/zUFEp8NAFr/vGf2XiZJ3CcBkPhswdH6Dc1/bbkHAEj8SuY3iv8eAKw2P/r94UgANoyTov+YpnYCIPMzTltkD03jv34CIPEzThvaQ2PzawOAhK9kfsZeJkd//RbQBYDG5jsB0KlCEGbcQdAeH/5e9xKIxGefPLT+Bub3TQC2+dFXv4x9PDzh6PGeCZAhvBMAsUP+/coAAzBN/J4JkNF/nQDTILs/0coUiACQAeJ99UJP1k0AdBFjt4EoAM0h+A0V5+mQ1yeyGwAAAABJRU5ErkJggg=="},"1228":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAADCUlEQVR4Xu2cwW0TARQFnYqohwrSAiXQAmVRUVCQfCGyWbHjyMObnFdv/583/k4uebn0M03gZXr7lr8kwLgECZAA4wTG1+8CJMA4gfH1uwAJME5gfP0uQAKMExhfvwuQAOMExtfvAiTAOIHx9bsACTBOYHz9LkACjBMYX78LkADjBMbX7wIkwDiB8fW7AAkwTmB8/S5AAowTGF+/C5AA4wTG1+8CJMA4gfH1uwAJME5gfP0uQAKMExhfvwuQAOMExtfvAiTAOIHx9bsACTBOYHz9LkACjBMYX/95L8C3H2+3unn7+nq3tpcv/QPMo14/pwB3yr8udk+CUwL8g3in3ne0qQc9pxXgncctCU4V8hf5/rfrkwB/frJOCvAed0rAB33Sb8UmQAJ8snJHXnfgd4Bn/QroAhwp+AHPvP28/P6r4fT5PfkVcPr9D2BzL/I5vwI+GcKh113F+P76gdlVPkTAQ8NwDyUAx1KZlADK2rihE4BjqUxKAGVt3NAJwLFUJiWAsjZu6ATgWCqTEkBZGzd0AnAslUkJoKyNGzoBOJbKpARQ1sYNnQAcS2VSAihr44ZOAI6lMikBlLVxQycAx1KZlADK2rihE4BjqUxKAGVt3NAJwLFUJiWAsjZu6ATgWCqTEkBZGzd0AnAslUkJoKyNGzoBOJbKpARQ1sYNnQAcS2VSAihr44ZOAI6lMikBlLVxQycAx1KZlADK2rihE4BjqUxKAGVt3NAJwLFUJiWAsjZu6ATgWCqTEkBZGzd0AnAslUkJoKyNGzoBOJbKpARQ1sYNnQAcS2VSAihr44ZOAI6lMikBlLVxQycAx1KZlADK2rihE4BjqUxKAGVt3NAJwLFUJiWAsjZu6ATgWCqTEkBZGzd0AnAslUkJoKyNGzoBOJbKpARQ1sYNnQAcS2VSAihr44ZOAI6lMikBlLVxQycAx1KZlADK2rihE4BjqUxKAGVt3NAJwLFUJiWAsjZu6ATgWCqTEkBZGzd0AnAslUkJoKyNGzoBOJbKpARQ1sYNnQAcS2XSL9uKOYHjyd48AAAAAElFTkSuQmCC"},"1230":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAB60lEQVR4Xu3YQREAIBDDwMM1VlALM9jI4uBIHm3X7HPHy/7AIkCW/T+cAG3+BIjzJwABhMC0AzJAGr8QGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/AQggB2g7YAM0OavBsb5E4AAdoC0AzJAGr8aGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/AQggB2g7YAM0OavBsb5E4AAdoC0AzJAGr8aGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/AQggB2g7YAM0OavBsb5E4AAdoC0AzJAGr8aGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/AQggB2g7YAM0OavBsb5E4AAdoC0AzJAGr8aGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/AQggB2g7YAM0OavBsb5E4AAdoC0AzJAGr8aGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/AQggB2g7YAM0OavBsb5E4AAdoC0AzJAGr8aGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/AQggB2g7YAM0OavBsb5E4AAdoC0AzJAGr8aGMdPAALYAdoOyABt/mpgnD8BCGAHSDsgA6Txq4Fx/DMPnLAIkPUqjQAAAAAASUVORK5CYII="},"1232":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAEJ0lEQVR4Xu2cQVLdMBBE4T5ZZ5Nb5BQciVPkFtlknfskZcB8YWw8tr/UPdJjSdnI6n7qGckuHh/4GVqBx6Fnz+QfAGBwCAAAAAZXYPDpkwAAMLgCg0+fBACAwRUYfPokAAAMrkAx/adff/+Vajz//Nb9Aul+gqWhS4OvoN8LHEMAcE/j16DJDEOXANQ2/KvkyAZDNwAoTd8CIgMMqQFwND1biUgJQBbjM+woUgGQ0Xj3REgBQC/GOyaCNQA9Gu8GgSUAvRs/Q+CwS7ADYBTzJwgAYKVD6gmA5z+/V48Inr7/eP+9GgKrBOjF/NL40mzHHYENAKX5k4B7wl15kVPz3tn86POTAG9uZAVgGfNR410aQcsEeGmQ3urnUUFrre5IPT8zNgmwkgAf9sorjdRRKLbMWxo2/92164+OGYUBAHYAWG2cNrrrLdGj5ilSBwBOABBdXRmuA4DCpV62gUfAAwAAkDbi0sE/NWGLr3KPrKSs15IAJIB0EUoHJwH0L4QAQFw7KAGUAOkilA5OCaAEfGCAc4D29YgEaK/5hxHpAegBpItQOjg9AD0APYD4fxCQAPQAYgV4HSxdhNLBS/RG3AJO82cXQAJIF6F0cBKABHhngBKg6cVsEmCa/ogQ0ANwEihdhNLBOQmkB+AkkJPAGwP0AO0bQUpAe815HbylOQnQnkYSoL3mJAAJcFOAcwDOAaQpLB2cdwGcA/AugHOAVwbYAWi6UUqARveXUdUN4PQMAAAAQgXYAcgXoPwBZgboATQLEQA0utMD8C0ATSDfAojPANgFCOOfbeBCfJpADY00gRrdaQJpAmkCaQJpAm8M0ANoahE9gEZ3ixdBbAMHNx8ABAA4vAIup21RAkap/27m2yTACAA4mm8DwPQgvULgavxcBixKQFmTegHB3XhbALKnQRbjrQHI9pVQNtPtdgFf7cacS0Jm41MkgHNv0IP5VruAM2cyynQAgDOONbynNhwA0NDMM0MBQEw1u3OA2GPvXwUA+xql7wGUuwdKQAww2VUkQEx6SkBMp09XkQAnhWt1GwkQU5oEiOlEApzUSXZb7QSYJtZDGSABLiAKABfEq30rCRBTmASI6bR6FQlwQbzat5IAMYVJgJhOJMAFnSS3kgAx2UmAmE4kwAWdJLeSADHZSYCYTiTABZ0kt5IAMdlJgJhOm1dlPwsAgIsAZH8nAAB3ACAzBOkBaFHro4xkLAcpAXAyfQlHNgjSAeBsfglDFhBSAJDF9IxpYAtAVtPX+gXnNLADoCfjM5QEGwB6Nd4dAjkAIxg/Q+BYCqQAjGS+KwQSAEY03rUUAED0mO/O17mUg6YAjL7yHc8JmgGA+esRok4CALhztJ/5c0oImgDA6t/HQgVBdQAwf9985fcEABDzp/pVXSYAq/8YNwoIqiYAAPgD8B/6L/+Q8H8tRgAAAABJRU5ErkJggg=="},"1233":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACy0lEQVR4Xu2UwW1CQRTEoJu0lAppKd0EcciVjWR9CWvMnfnzPNbeb/2mCdynr+/4WwKMS5AACTBOYPz8XoAEGCcwfn4vQAKMExg/vxcgAcYJjJ/fC5AA4wTGz+8FSIBxAuPn9wIkwDiB8fN7ARJgnMD4+b0ACTBOYPz8XoAEGCcwfn4vQAKMExg/vxcgAcYJjJ/fC5AA4wTGz+8FSAABga/vX9zy5/FedvKNUzYuf12A4wUg4/yxO41EvnHKvm4/nOwQ4HUmGej1/9NIJP+UjWe6LmBDgP8MlADXWVby5xLwvACfy1DdLAHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE6IQHU8/HyCcAZqhMSQD0fL58AnKE64QlhNBiBp6J1dAAAAABJRU5ErkJggg=="},"1237":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC6ElEQVR4Xu2VwW1TYRgEk4a4Uxd1UBd3GgL5YClCIp7fwhJvdnzN2vHOzvv8/tZrmsD7dPvKvyXAuAQJkADjBMbrdwESYJzAeP0uQAKMExiv3wVIgHEC4/W7AAkwTmC8fhcgAcYJjNfvAiTAOIHx+l2ABBgnMF6/C5AA4wTG63cBEmCcwHj9LkACjBMYr98FSIBxAuP1uwAJME5gvH4XIAHGCYzX7wIkwDiB8fpdgAQYJzBevwuQAOMExut3ARJgnMB4/S5AAowT+FD/29cvv77/+Dn1UOjLnox6krU8NpcT4HSkk/wtext26QpcToDbQKejngx68tmGK6AW4Jkxn3nPlUW4rACPTvWz5/zkfQZZLinA/Wfg/uT9eeJPRvzb0/to3Ed/v8pVuKwAd8D3sT8CP/nN/0yAzwT7F//jf5Dk8gK8GuKrBHv196afnwCUlDSXANJhaa0EoKSkuQSQDktrJQAlJc0lgHRYWisBKClpLgGkw9JaCUBJSXMJIB2W1koASkqaSwDpsLRWAlBS0lwCSIeltRKAkpLmEkA6LK2VAJSUNJcA0mFprQSgpKS5BJAOS2slACUlzSWAdFhaKwEoKWkuAaTD0loJQElJcwkgHZbWSgBKSppLAOmwtFYCUFLSXAJIh6W1EoCSkuYSQDosrZUAlJQ0lwDSYWmtBKCkpLkEkA5LayUAJSXNJYB0WForASgpaS4BpMPSWglASUlzCSAdltZKAEpKmksA6bC0VgJQUtJcAkiHpbUSgJKS5hJAOiytlQCUlDSXANJhaa0EoKSkuQSQDktrJQAlJc0lgHRYWisBKClpLgGkw9JaCUBJSXMJIB2W1koASkqaSwDpsLRWAlBS0lwCSIeltRKAkpLmEkA6LK2VAJSUNJcA0mFprQSgpKS5BJAOS2slACUlzSWAdFhaKwEoKWkuAaTD0loJQElJcwkgHZbWSgBKSppLAOmwtFYCUFLSXAJIh6W1EoCSkuZ+A4ZdYIGru4+jAAAAAElFTkSuQmCC"},"1239":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAB7ElEQVR4Xu3YQREAIBDDwEMbYvCvAGawkcXBkTzarj3njpf9gUWALPt/OAHa/AkQ508AAgiBaQdkgDR+ITCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/gJQAA7QNsBGaDNXw2M8ycAAewAaQdkgDR+NTCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/gJQAA7QNsBGaDNXw2M8ycAAewAaQdkgDR+NTCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/gJQAA7QNsBGaDNXw2M8ycAAewAaQdkgDR+NTCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/gJQAA7QNsBGaDNXw2M8ycAAewAaQdkgDR+NTCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/gJQAA7QNsBGaDNXw2M8ycAAewAaQdkgDR+NTCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/gJQAA7QNsBGaDNXw2M8ycAAewAaQdkgDR+NTCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/gJQAA7QNsBGaDNXw2M8ycAAewAaQdkgDR+NTCOnwAEsAO0HZAB2vzVwDh/AhDADpB2QAZI41cD4/hnHj5h1QEoiO32AAAAAElFTkSuQmCC"},"1242":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAADEklEQVR4Xu2bwW3iABQFoYRUkCbSfwVpIhWkhEQckBBC2B7DwfNnzzyJN2/816y051N/RhM4j25f+VMCDJcgARJgOIHh9bsACTCcwPD6XYAEGE5geP0uQAIMJzC8fhcgAYYTGF6/C5AAwwkMr98FSIDhBIbX7wIkwHACw+t3ARJgOIHh9bsACTCcwPD6XYAEcBP4+vj8uzT8/v1J9gdT66EkwPMHXC3AdfylCzBZkhECLJ3/BBC+Bqx9+i/VE0AmwO34S+f/VoA1n5Wh8v3fwK3jXwedegVU7wB0/MlXQCPAnvHvr8CkvwoOL8D98HvGe4VER3tHOLQArxx/6hU4pADvGP72yd3yE/JoT/z99z2UAI+G33Pyn403RYJDC7D0L3x7ns4p7wOHEmDPoDRrFyEBVphhliABVghg/oWQAFCAa+yd7yEbvhr+aAJsRPfun6Abv87ujycARGj5mZgAUABLLAEsS8IeCQDBWWIJYFkS9kgACM4SSwDLkrBHAkBwllgCWJaEPRIAgrPEEsCyJOyRABCcJZYAliVhjwSA4CyxBLAsCXskAARniSWAZUnYIwEgOEssASxLwh4JAMFZYglgWRL2SAAIzhJLAMuSsEcCQHCWWAJYloQ9EgCCs8QSwLIk7JEAEJwllgCWJWGPBIDgLLEEsCwJeyQABGeJJYBlSdgjASA4SywBLEvCHgkAwVliCWBZEvZIAAjOEksAy5KwRwJAcJZYAliWhD0SAIKzxBLAsiTskQAQnCWWAJYlYY8EgOAssQSwLAl7JAAEZ4klgGVJ2CMBIDhLLAEsS8IeCQDBWWIJYFkS9kgACM4SSwDLkrBHAkBwllgCWJaEPRIAgrPEEsCyJOyRABCcJZYAliVhjwSA4CyxBLAsCXskAARniSWAZUnYIwEgOEssASxLwh4JAMFZYglgWRL2SAAIzhJLAMuSsEcCQHCWWAJYloQ9EgCCs8QSwLIk7JEAEJwllgCWJWGPBIDgLLEEsCwJeyQABGeJJYBlSdgjASA4SywBLEvCHgkAwVliCWBZEvb4B4yegIEyMnkpAAAAAElFTkSuQmCC"},"1244":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACe0lEQVR4Xu3WMW5UURQE0e+EhbBRxEZZCAlohEYiwEid3jqOLOslVbemxx+Pn7SBjzQ9+EcA8QgEIIC4gTi+BRBA3EAc3wIIIG4gjm8BBBA3EMe3AAKIG4jjWwABxA3E8S2AAOIG4vgWQABxA3F8CyCAuIE4vgUQQNxAHN8CCCBuII5vAQQQNxDHtwACiBuI41sAAcQNxPEtgADiBuL4FkAAcQNxfAsggLiBOL4FEEDcQBzfAgggbiCObwEEEDcQx7cAAogbiONbAAHEDcTxLYAA4gbi+BZAAHEDcXwLIIC4gTi+BRBA3EAc3wIIIG4gjm8BBBA3EMe3AAKIG4jjWwABxA3E8S2AAOIG4vgWQABxA3F8CyCAuIE4vgUQQNxAHN8CCKBj4NuXr7/etN9//hD/8zwZCe/jvw7/+l0Afz4KiQD+Pv57AUQQCeBfx3+hf/b3zhdiJID/HdQKRL4CRPC5gcT/ALVZX3gFsNg6+FYAB4+6IAlgsXXwrQAOHnVBEsBi6+BbARw86oIkgMXWwbcCOHjUBUkAi62DbwVw8KgLkgAWWwffCuDgURckASy2Dr4VwMGjLkgCWGwdfCuAg0ddkASw2Dr4VgAHj7ogCWCxdfCtAA4edUESwGLr4FsBHDzqgiSAxdbBtwI4eNQFSQCLrYNvBXDwqAuSABZbB98K4OBRFyQBLLYOvhXAwaMuSAJYbB18K4CDR12QBLDYOvhWAAePuiAJYLF18K0ADh51QRLAYuvgWwEcPOqCJIDF1sG3Ajh41AVJAIutg28FcPCoC5IAFlsH3wrg4FEXJAEstg6+FcDBoy5IAlhsHXwrgINHXZAEsNg6+PY3SlkkgXVfTqoAAAAASUVORK5CYII="},"1245":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAADeUlEQVR4Xu2bQXKEMAwEs5c8JB9N5aN5SC6b4kBlK8WCbCwtnumcBaxG7ZFsyO2NP2sFbtbZk/wbAJhDAAAAYK6Aefo4AACYK2CePg4AAOYKmKePAwCAuQLm6eMAAGCugHn6OAAAmCtgnj4OAADmCpinjwMAgLkC5unjAABgroB5+jgAAJgrYJ4+DgAA5gqYp48DAIC5Aubp4wAAYK6Aefo4AACYK2CePg4AAOYKmKePAwCAuQLm6eMAAGCugHn6OAAAmCtgnj4OAADmCpinjwMAgLkC5unjAABgroB5+jgAAJgrEEz/8/3jvoR+/XxLLRqpZIK17A5ThGBaAJZiVK9GAOheO+MvrAZgLb5aG5jSAapX4mPxAWD8Ym6+YyUAysVfhMcBDvADgOb1mX8BDjBO46kdILsf/1/92c8bV9b4nQBgRysAiINUFlnZk7cAUHOB6RwAAMauNQBo3AWs4dWnkGPL/ne36QHItuRnbSD7uVkF/39fAAgorTwLTAfAUq/KOWDlQ3VHAAABB9iCjhYQFC4j7CoOoAABDhAklBYQFKoirLoYDIEVVW14RiUAbAMbClMVCgDjlJaYAbKGMfXVv+gGAI1vAzkKHuc+3XeqGspwgO4S5V5YBcCzA6CslpOr2vbdZVpAVlHUXQAAAsuu0nECP2doCAAE5VSFAAAAIKjAhcKqV6PyHIADBMAGgIBIlSGVDrBX/KydR6WWUzrA1v486yNNAKjEsfFZ2f8ipl78ad8FNHLSHQ4A3dJpXFg5a7xKsWlngGzBHIpPC9ihCACyl9jF7w8AFy9Q9s+r/OwsO5e9+zMDNLaBrPOGV0EAAADwKvau/1yHOQAHOOBQHQIAAIDrW/Erf6Hyq2AOggJkAUBAJOUQAFCubiA3AAiIpBrC62DVygbycig+Q2DjKeBjuMqRMOcATyDAAQI2qRriUnxaQMfqV7H+NXVawAYEOICqtzfkpb7/xwE6XwKtl6m0AlqA+VYQAMydAAAAoGEyMgxV3xHgAAGolSEAAAAIKGAeggMAwH1PgpnPBGgBAbhxgIBIyiEAoFxdzgGMq3uy+MvlM/d/vgc48R5A5aUQQ2DH9wAqxccBnjjA0dCnYP18D3DS/mfv/QBwAgCV4tMCOlsAAIjvHI9mAAAwB4AhEACmPwBiCDwxBOIA4g6wpHc0B6hA8AuEwMyQDsA6XgAAAABJRU5ErkJggg=="},"1248":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAB7klEQVR4Xu3YURHAMAzD0IRt0Q3N+Kx3o6FXBqn0YXvP837jZX9gCZBl/x9OgDZ/AsT5E4AAQmDaARkgjV8IjOMnAAHsAG0HZIA2fzUwzp8ABLADpB2QAdL41cA4fgIQwA7QdkAGaPNXA+P8CUAAO0DaARkgjV8NjOMnAAHsAG0HZIA2fzUwzp8ABLADpB2QAdL41cA4fgIQwA7QdkAGaPNXA+P8CUAAO0DaARkgjV8NjOMnAAHsAG0HZIA2fzUwzp8ABLADpB2QAdL41cA4fgIQwA7QdkAGaPNXA+P8CUAAO0DaARkgjV8NjOMnAAHsAG0HZIA2fzUwzp8ABLADpB2QAdL41cA4fgIQwA7QdkAGaPNXA+P8CUAAO0DaARkgjV8NjOMnAAHsAG0HZIA2fzUwzp8ABLADpB2QAdL41cA4fgIQwA7QdkAGaPNXA+P8CUAAO0DaARkgjV8NjOMnAAHsAG0HZIA2fzUwzp8ABLADpB2QAdL41cA4fgIQwA7QdkAGaPNXA+P8CUAAO0DaARkgjV8NjOMnAAHsAG0HZIA2fzUwzp8ABLADpB2QAdL41cA4fgIQwA7QdkAGaPNXA+P8CUAAO0DaARkgjV8NjOMnAAHsAG0HZIA2fzUwzp8ABLADpB2QAdL41cA4/pkL5kZ1EHqCMu4AAAAASUVORK5CYII="},"1250":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAEnElEQVR4Xu2dS1LdMBBFHzvIkCqG2QP7H2cPGVLFMDsgZaccjJFtfVpSfw5T5LbV9+h2W3LB04Of0Bl4Cj17Jv8AgOAQAAAABM9A8OnjAAAQPAPBp48DAEDwDASfPg4AAMEzEHz6YRzg5cfPj7c/v8PMN5dr9wlZhD8mAxA+M+IWgJTwV6siKhSuACgV/QyISDCYB0BK9KjuYBKAEaLnNlGpcZYcxBQA2oUvgUYLJCYA8CT8HSSjwVALQCTR76DY/14aEHUAIHwJDo9HKxBqAED4QuGfX9cLXt5/NUGgAgDErxd/ubLFBaYBgOhlom+j355f11Uv1RdMBWCZzNnPcZJ16bJ/1TFHqby4dIAUHNGg2HJwN2+XACR32HaOcZcUi2s/Z7VL7zxOLQEtInlyiNyVLi3+Es8sAHcOkQvXTCdpEf5/U9j4kYsrAHJF/9JBXzSi23t2TdwcQCXga6n/7hxASqgSQHIgkVjpZ3MDgB6qF8S8E/fu9wW3Sg4FgNYMCl2/b0o3a+8t/vLoACAkoFSY2le52vsDQG3mOl6X2q7tdTsA6JXZhrgAkJE8z4dBAAAA307sMlJSNYQSUJW2vhfhABn59V4CcjaIMtJ0OwQHuE3RnAGjXAAA5uh7e1cAuEmR5xKw7tAlPt26paZiAA5QkbQRlwAADrBmQOLI9yqVJh3Au/1vgo1wAQAY4eeV9wCAk8ThAJVEJS7DAeRyKR4JBwjsACPEX183LX4UGqEEAMCFoQKAXLXBAeRyKRoJB8ABum8C0QOIrlnZYDgADoADnDFAEyjnNuaawAjicxwc3P4BAAD4ICRy/ccBcAAcAAf4/ufc5Hr/z0i8BfTIqkBMNoICHwXTA9AD0APQA9ADJBlgJ1CgwdiFoAmUzadotBGNIACISiYbDAB4E+h+JGzOARYm6APknAYA5HIpHokSQAmgBKQYiFQC1pJ3+BcvklZDCZDMZodYPctAq/jLdKf8ufgoDjDiTKAVAgDosOr3IXs5QKvw2zMCgCEApETfTxkADADQQ3gcoLPwW/jWEtBTfJrAARC0ANBbfAAYAEDtm8AI8acBEOk8oASAUaJPbwKPC8/7vkBOGZgh/lQHqHFfq6BcATBL+KlvATXil16jCZYUALOFdw9ADjCzINEivrkSkCNqyZgSAFpFW+7VGqNkbrljp+wE5j5c73EjAeg9l9r4AJCZOY2rN/PRL4cBQGYWASAzUZaGUQImfRCiBRIAAICPXBgpAbmZMjQOB8ABcABDC1b8UXEAHAAHEF9WhgLiADgADmBowYo+asnqX27Ma6Bo+ucHKwXAKwRhzwIA4N8iBIACM/JYBgAAAAoy4GgoJSBwCagRnyYw+Orfpu+tDwjXA9Su/iP/XkAIA4CU8HsQPEDgGoAeop9VQqswuARgpPDWHcENALNETzmCJTcwDYAm0a02iWYB0Cy+pbJgEgAr4lsAwRQAFoXXvoFkAgDLwmvvDdQD4El8jecJADDhjEPTa6JaALytfK2lQCUA3sXXVAoAYEIJ0PRmoA6ACKtf0/6AKgCiia+hFADAxBKgoRSoASDi6tcAwF+YDbmfRkxr3AAAAABJRU5ErkJggg=="},"1253":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACsElEQVR4Xu2WMW4CQRAEIeEh/ijyR3kIiRHBSZdYQnCrbqbKKeZmuqauxfnkH5rAGZ3e8CcFgEugAAoAJwCPbwMoAJwAPL4NoABwAvD4NoACwAnA49sACgAnAI9vAygAnAA8vg2gAHAC8Pg2gALACcDj2wAKACcAj28DKACcADy+DaAAcALw+DaAAsAJwOPbAAoAJwCPbwMoAJwAPL4NoABwAvD4NoACwAnA49sACgAnAI9vAygAnAA8vg2gAHAC8Pg2gALACcDj2wAKACcAj28DKACcADy+DaAAcALw+DaAAsAJwOPbAAoAJwCPbwMoAJwAPL4NoABwAvD4NoACwAnA49sACgAnAI9vAygAnAA8vg2gAHAC8Pg2gALACcDj2wAKACcAj28DKACXwPXy87el/73fkC8DJvT+2Hvln4ffPiNKgBDg1QO/+n+TOnO0AO9UPE2CsQJ8cshPvvtt7TBSgCMOeMQzvkGGcQIcebjns6b/MBwlwIqDrXhmUzOMEeDIN39/IAVo0vWfXVYdfxs3WYIRDbD6QKufn3zHRgiwGqACrCbs82MEbIAY+o7BCtBxh9gWChBD3zFYATruENtCAWLoOwYrQMcdYlsoQAx9x2AF6LhDbAsFiKHvGKwAHXeIbaEAMfQdgxWg4w6xLRQghr5jsAJ03CG2hQLE0HcMVoCOO8S2UIAY+o7BCtBxh9gWChBD3zFYATruENtCAWLoOwYrQMcdYlsoQAx9x2AF6LhDbAsFiKHvGKwAHXeIbaEAMfQdgxWg4w6xLRQghr5jsAJ03CG2hQLE0HcMVoCOO8S2UIAY+o7BCtBxh9gWChBD3zFYATruENtCAWLoOwYrQMcdYlsoQAx9x2AF6LhDbAsFiKHvGKwAHXeIbaEAMfQdgxWg4w6xLRQghr5j8AMi+liBfKAkvQAAAABJRU5ErkJggg=="},"1254":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAD1ElEQVR4Xu2b0XHcMAxE7X5SjatISaki1aSfZBT7xpqbswUcCQLgvvyGIojdp5VEnl9f+CetwKt09zT/AgDiEAAAAIgrIN4+CQAA4gqIt08CAIC4AuLtkwAAIK6AePskAACIKyDePgkAAOIKiLdPAgCAuALi7ZMAACCugHj7JAAAiCsg3j4JAADiCoi3TwIAgLgC4u2TAAAgroB4+yQAAIgrIN4+CQAA4gqIt08CAIC4AuLtkwAAIK6AePskAACIKyDePgkAAOIKiLdPAgCAuALi7ZMAACCugHj7JAAAiCsg3j4JAADiCoi3TwIAQF8Ffv7+8/dY/a+3H+EgH7VW1FntRrhwkQ2tBmAVbJGa3c/dFoCb+StMWVlrpflHrZYAnA0BgDFk2gFwb340AKvrjdnpvxoALjQDAD9UoVesNmR1vVDxHkzePgGiP80AYDWSzkgGgDGDWidAtPmHtCTAGGAhV2dsAN0aWQFdiGhfTNouAVaKo1ALABRc/qZHAAAAcQUc7e94ItgyAbKMyKrrYNQ9tB0AK78Azmpm1XU76rwAAIyC7Xok3AqATBMyaxsZfWoYABhlW/0bBOOyhoe1ASDTgJ23gwHAcA8BgEGkyCHZBmTXj9S2RQJkG5BdHwA+fv+fdSKX+f4Raf4xd8sEyDiSZSMoGsVv5t/5DkyU9X/pFglwE2nHvXgAyFZAvH6rBBD3KqR9ADDKuuvjpxUAmSbwFWC8UyKHZZqQWTtS0zYJkHkcm1k70vxWn4GZJuy8D9EiATIN2PkcoE0CAEDcg6B8AmTfgdn146x/nxkALhQGgGgEixsAAMkAHOV5B4gzofwj4B6A1b8FyIQvzvbPmVsAcIZgNQDZtaMhaANAtBCq8wOAqvMffQMAAPRQIPMouIdCz62yTQIAwHMGX13VAoDMk8ArAbv/PwB0d3Bw/eUBqLIRs+sjCACMdxAAGIWaPazKYQwAzHbWMN8j84/LVm8H7/wSWvoRAACGu2RwCAAYBKzyImpYqntIOwBWx//9cXTGI8jtquMCADCIVeVF1LBU95BWAGTc/Y8SYKcUKA3AWfxK5gOAO2h6X8AjoLd/w6vnK2BYwt4TsBHU279pq99xO7j8S+A095jooQIAIA5GCwB2jN4q3JUHYOcXsAoQAIDDhR2TCACcAOy0C3j0UhqAajtwt/VkbUs7WDUPBQCzVJ9/pg4ADtFGhlZNgJ0eAySAkdBqMBqXfTkMAC4leh8AAEahZg6rdAoHADOddc5V4e0bAJym7Ta8UhrN1Lb0O8DMRmfMVSGJZvRxngMAZivabL5/w8zokCTPJ4AAAAAASUVORK5CYII="},"1255":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC1ElEQVR4Xu2aUY6CQBAF5Z57GA+z93TjJiTGIDID3dBT5bfD5L0uakSdbr7QDUzo9Ia/CQAcAgEQAHgD8PgaQADgDcDjawABgDcAj68BBADeADy+BhAAeAPw+BpAAOANwONrAAGANwCPrwEEAN4APL4GEAB4A/D4GkAA4A3A42sAAYA3AI+vAQQA3gA8vgYQAHgD8PgaQADgDcDjlzfA4/77eM5wuv+Uz3IGi6VLm4c/FycE7QiVBeB9+NEWGBW2cgAsDT7SAJ/2G8U2pQBYG36EAbJhaxf4/hVlALjS8CNg2z/KvisIwEJv2bD1je6YVeUBiDiLRz/3X9ERgI0GiADtmHt431XKAxB1Hmc/Zu4bY//qMgA8I2Z/KidAUAqANQiiFD06BOUA+ARBFABn7Ncv9PaVAvCls9GfCMoBkD2Q7P3a7+F9K0oA8O2LmcwngcjfHfaNsm/15QHYMvxsACI/b/SNsX/VEABEDWR0/f/fOP3s5KzMfvZ/TzU6BAKwgeORvwsoDUDU2b/FAlHHzgYeD33L5QGY056tYv8Sdih3fRc7S8Vn7dvXUtuqMgZYMkGGhkcefomngDaej3+3ABzfabkrvkKQYZ3MgsodAZnlEPYSAMKUVzIKgADAG4DH1wACAG8AHl8DCAC8AXh8DSAA8Abg8TWAAMAbgMfXAAIAbwAeXwMIALwBeHwNIADwBuDxNYAAwBuAx9cAAgBvAB5fAwgAvAF4fA0gAPAG4PE1gADAG4DH1wACAG8AHl8DCAC8AXh8DSAA8Abg8TWAAMAbgMfXAAIAbwAeXwMIALwBeHwNIADwBuDxNYAAwBuAx9cAAgBvAB5fAwgAvAF4fA0gAPAG4PE1gADAG4DH1wACAG8AHl8DCAC8AXh8DSAA8Abg8TWAAMAbgMfXAAIAbwAeXwMIALwBeHwNIADwBuDxNYAAwBuAx9cAAgBvAB5fA8AB+APoAsCBzBHsCAAAAABJRU5ErkJggg=="},"1256":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC/0lEQVR4Xu2ZMW6TYRQEkxvQU3L/I1HScwOQi0jG/LYURVPMt5MKpVjt2x2/7zm8v/UzncD79PQN/xYA4xAEQACMJzA+fhsgAMYTGB+/DRAA4wmMj98GCIDxBMbHbwMEwHgC4+O3AQJgPIHx8dsAATCewPj4bYAAGE9gfPw2QACMJzA+fhsgAMYTGB+/DRAA4wmMj98GCIDxBMbHbwMEwHgC4+O3AQJgPIHx8dsAATCewPj4bYAAGE9gfPw2QACMJzA+fhsgAMYTGB9/bgN8//bjz6/fP+fmfsb5XBAB8C8KAdATsJVAG6AN0A1wx0BPwNYC/G/aAAiArQS6AboBugG6AfpD0AcD3QBbL2BHYDdAN0A3QDdAN0A3wPjbfzQAt3f+NuDVf/u+ugEW74NjvwU8K/PV759Bc/KyOBaAW2lXZX8WjJPLv812PACPn+rPQHF6+ccDcLUFHgF4dS8EwCEJ3Jf++O/Fd/++1qOfgI9B7z/lHwCsf/KP/hp4tbjui799PVz8yneVy8QGeNwE62t/7gm4egoOOW++PMbUBnj2t4EvpygWmANA3BViPQCQWD2iAeDpCnEaAEisHtEA8HSFOA0AJFaPaAB4ukKcBgASq0c0ADxdIU4DAInVIxoAnq4QpwGAxOoRDQBPV4jTAEBi9YgGgKcrxGkAILF6RAPA0xXiNACQWD2iAeDpCnEaAEisHtEA8HSFOA0AJFaPaAB4ukKcBgASq0c0ADxdIU4DAInVIxoAnq4QpwGAxOoRDQBPV4jTAEBi9YgGgKcrxGkAILF6RAPA0xXiNACQWD2iAeDpCnEaAEisHtEA8HSFOA0AJFaPaAB4ukKcBgASq0c0ADxdIU4DAInVIxoAnq4QpwGAxOoRDQBPV4jTAEBi9YgGgKcrxGkAILF6RAPA0xXiNACQWD2iAeDpCnEaAEisHtEA8HSFOA0AJFaPaAB4ukKcBgASq0c0ADxdIU4DAInVIxoAnq4QpwGAxOoRDQBPV4jTAEBi9YgGgKcrxOlf0fKogfjuC1UAAAAASUVORK5CYII="},"1259":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAELUlEQVR4Xu2ca3riMAxFYUWz/2XMipgPStoMzUNJbOtKOv2Lk2DdoyvZJr3f+CsdgXvp2TP5WzgAHn9vD4tu9z/x5maZV+sx8gBYBbcEBih+R0kOgJaCf04XAMQB6Cn+NHUg+B8CCQcYIfx82kDwEw13AEaL/5w6AIgAgPiW1rXvGBcH8BCeHmAZpOEAIH7fjD569zIAUPcFHMAr+xF/3ReGOYCX+HT920VhCACe4gOAMwDe4gOAIwAK4rP8A4DvCNAMDj4MUnIAzgIGLwNVxackDDoNVAcAR/iKQLdlYCQAjm6fLo2P2l8AQAv13/eICAEANAQgYn8BAB0AiLT5BACdAIgCAQB0BCACBADQGQB1CAAAAPpEoNo+wF4UVZeI3RzgGRAg+MECAPZSpMDnihDgAAPBKwcAZeDj5E3wlfWuDgAAAPCKAM3g++i1ogNMOQAEmi+ldi8BcxOsDIFiA9j1ByFbzXU1EFTFdwOgWl8AABt2kN0NlMV3dYAKvYG6+DIAZFspRBB+ivnQVYBl1zV6SYgkvpwDRG8Oo4kvCUBkCADA4vGGMVHLAAAYxLUMAQBLlNqMkWsCKQFthLXeBQCskTKMowQYgmQZQgmwRKnNGDkHiCr+a0kleN6/hwkA7EXowOcAcCBYS0MjZz8OUFx8ALgAQPTMn089WhmQ6AEA4EL2XLzUHYBM4k9aRHIBVwAyih+tHADARQvdujyCEwBARwAirAwAoDMA6hAAwAAAlJtDABgIgKIbAMBgANQgAAAAcIjA+5HZ9wEiLBFxACf+VfYIAAAAnCJAGZD4BZGrAzwZoA/wTUB3AKbpVwRBoQ+QAaCiGwDAgvtVcgIA2Ch/FUAAgJ3+JzsEAHCwAc4GBAAcBGBpeFQoFMR/HUw10ED2FspwAMBgbNRgAIDBACjtM6iIn74EKPYMSuIDwEAXUhN+mnrqJnBN35H9gKrwZQEYJb668CUB6Cl+FME/XbFUCWgNQFTR5xCUAaCl+BmEL1UCEH99uVPCAVoBkCnzcYATewAAcCJoCpfgAJSARysQs7kAPcAJMjJBUAKAHieBWSAAgBMO8DpFC/h/gZemWgYAXGCZ9FIAzEPAyuArGmUBmGBoAULkclAegBalAQBONlJKl111gqgQ4AAzCitCAAAAoGTEvt8FB/CNv/vTAcBdAr8vUFH88vsAV0Wf48oqwC95zU9uKXgG8Us5AOIXPQtA+G2DTLsP0Ev4TEfBaUtAL/GjNnpbHpDKARDe3A9/D0wDAOIfFz9FCeglfLZav4ZHWAfoKXwV8cM6QG/xAeBcORlyFeK3DXOoEjBC/ErZH6oEjBI/yx6/1SdCOICH+FVAkAfAW/zsIEgDoCR+VhBkAVAVf3VDJei7ggBg7ZaM46IdGEkCEC37I7sCABgz++owVWeQAyBL9kdxhX/LP3qQmy00kQAAAABJRU5ErkJggg=="},"1260":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAADZklEQVR4Xu2Y7W3bUBAE5dpSTGpKMakthgMIIARRH5DsGb4b/5Wo3duddyT9cepvdAIfo6dv+FMADIcgAAJgeALDx28DBMDwBIaP3wYIgOEJDB+/DRAAwxMYPn4bIACGJzB8/DZAAAxPYPj4bYAAGJ7A8PHbAAEwPIHh47cBAmB4AsPHbwMEwPAEho/fBgiA4Qm8MP6v0+9/58v/nv4c8jAdzvQ29K/wqeAtPl7g9/+lhwLgMnTq9K1S/jIA/NQmuAYgtYFePfnn6w+1AbZD/3QZlu3zruIPD8DXAM9AcP7u3ol99HPqtvPu4pcA4BoE9wreu13cAuAZ0L6rqO/63cPeAi4DufdK9ujnlwCtXP7hHgLvnYK9kh8t/3I7rF7+0gBsy3wXAEd/4r92gJa5BZyHu/aO/igA24JXete/tTmXB+By+GunePsAuOrr3h4EywGw93q49/p2uR0m3Pe3MIwC4Nbp3zshK973lwfg2vPArSKnrf0xANx7bXz2fwnP/t4Rvr/kLeAIwVs8BoClCchHAEDBW2QDwNIE5CMAoOAtsgFgaQLyEQBQ8BbZALA0AfkIACh4i2wAWJqAfAQAFLxFNgAsTUA+AgAK3iIbAJYmIB8BAAVvkQ0ASxOQjwCAgrfIBoClCchHAEDBW2QDwNIE5CMAoOAtsgFgaQLyEQBQ8BbZALA0AfkIACh4i2wAWJqAfAQAFLxFNgAsTUA+AgAK3iIbAJYmIB8BAAVvkQ0ASxOQjwCAgrfIBoClCchHAEDBW2QDwNIE5CMAoOAtsgFgaQLyEQBQ8BbZALA0AfkIACh4i2wAWJqAfAQAFLxFNgAsTUA+AgAK3iIbAJYmIB8BAAVvkQ0ASxOQjwCAgrfIBoClCchHAEDBW2QDwNIE5CMAoOAtsgFgaQLyEQBQ8BbZALA0AfkIACh4i2wAWJqAfAQAFLxFNgAsTUA+AgAK3iIbAJYmIB8BAAVvkQ0ASxOQjwCAgrfIBoClCchHAEDBW2QDwNIE5CMAoOAtsgFgaQLyEQBQ8BbZALA0AfkIACh4i2wAWJqAfAQAFLxFNgAsTUA+AgAK3iIbAJYmIB8BAAVvkQ0ASxOQjwCAgrfIBoClCchHAEDBW2QDwNIE5CMAoOAtsgFgaQLyEQBQ8BbZALA0Afn4BFCfhIEcZ7vhAAAAAElFTkSuQmCC"},"1261":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACyElEQVR4Xu2aUU7rQBAE1/fkMDkM9wxKwFKEEssf21J7q97nExqma8qdQNiG/9AENnR6ww8FgEugAAoAJwCPbwMoAJwAPL4NoABwAvD4NoACwAnA49sACgAnAI9vAygAnAA8vg2gAHAC8Pg2gALACcDj2wAKACcAj28DKACcADy+DaAAcALw+DaAAsAJwOPbAAoAJwCPbwMoAJwAPL4NoABwAvD4NoACwAnA49sACgAnAI9vAygAnAA8vg2gAHAC8Pg2gALACcDj2wAKACcAj28DKACcADy+DaAAcALw+DaAAsAJwOPbAAoAJwCPbwMoAJwAPL4NoABwAvD4NoACwAnA49sACgAnAI+Pb4D77fu+3b6wHLDB9wdfAQAV+OnIj//f41NbANEACvD5KVeAPzY2wKIvBXvNvzuwLwFjLN8AZwV4+E9sAawAr08/+Y3g0gIcVbwC/GqvAC/vfXwJWOiN4Jk3eGe+ZiEkb6Ms3wBHT7UCLP4ScObp9VfBZyj5NcsSWPolYNmrTQymABNhXnGUAlzxahN3VoCJMK84SgHGGOSfBBRAAa5YXPN2Pvq0cN536Z2EbwD6bwMVAP53gWgB/n8k7KeBvS9Vkc0UwA+Dnj8C+hdBkefLoVcggH4PcIUDpXdUgDTh8vkKUH6g9HoKkCZcPl8Byg+UXk8B0oTL5ytA+YHS6ylAmnD5fAUoP1B6PQVIEy6frwDlB0qvpwBpwuXzFaD8QOn1FCBNuHy+ApQfKL2eAqQJl89XgPIDpddTgDTh8vkKUH6g9HoKkCZcPl8Byg+UXk8B0oTL5ytA+YHS6ylAmnD5fAUoP1B6PQVIEy6frwDlB0qvpwBpwuXzFaD8QOn1FCBNuHy+ApQfKL2eAqQJl89XgPIDpddTgDTh8vkKUH6g9HoKkCZcPl8Byg+UXk8B0oTL5ytA+YHS6ylAmnD5/B8FyHyBR4guyAAAAABJRU5ErkJggg=="},"1262":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC2ElEQVR4Xu2XMW7bABAE7SYPyUeDfDQPcRODhQCCoKQF3M2MmwDOuZjd4Yr6/OhHncCnmj74jwSQS5AACSBPQI7fAiSAPAE5fguQAPIE5PgtQALIE5DjtwAJIE9Ajt8CJIA8ATl+C5AA8gTk+C1AAsgTkOO3AAkgT0CO3wIkgDwBOX4LkADyBOT4LUACyBOQ47cACSBPQI7fAiSAPAE5fguQAPIE5PgtQALIE5DjtwAJIE9Ajt8CJIA8ATl+C5AA8gTk+C1AAsgTkOO3AAkgT0CO3wIkgDwBOX4LkADyBOT4LUACyBOQ47cACSBPQI7fAiSAPAE5fguQAPIE5PgtQALIE5DjtwAJIE9Ajt8CJIA8ATl+C5AA8gTk+C1AAsgTkOO3AAkgT0COr16AP79+///79U+dgRb+KP94+M8C3AlBlwQnwLWwZwVeBXgmxOMTgroUKAGWUo9CH3fnBXi1CHf/R3l1wAlwPKmPp/7676O0u9+/+t1DGuIK6AQ4P82rCFdxKE//wYEV4PzZfX4PuHtHuH4UnFfkXDbxhRAjwN3n/90b/iLA9dsB6Ym/sqAEePWV7tmL3DshyOXjPgLelbV8zyfO/KtcMAvwrnzym/zC/uxGJcBPgqL+bQJQmx25EmAMinqWANRmR64EGIOiniUAtdmRKwHGoKhnCUBtduRKgDEo6lkCUJsduRJgDIp6lgDUZkeuBBiDop4lALXZkSsBxqCoZwlAbXbkSoAxKOpZAlCbHbkSYAyKepYA1GZHrgQYg6KeJQC12ZErAcagqGcJQG125EqAMSjqWQJQmx25EmAMinqWANRmR64EGIOiniUAtdmRKwHGoKhnCUBtduRKgDEo6lkCUJsduRJgDIp6lgDUZkeuBBiDop4lALXZkSsBxqCoZwlAbXbkSoAxKOpZAlCbHbkSYAyKepYA1GZHrgQYg6KeJQC12ZErAcagqGcJQG125PoGbb3ogU7892UAAAAASUVORK5CYII="},"1263":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAE80lEQVR4Xu2ZzXHdMAyE7RLSg0/pv5ac0kNKiOdNrIyiSBQA4o/a9dUkRSw+LEG+9zf+QSvwDh09g38jAOAQEAACAK4AePh0AAIArgB4+HQAAgCuAHj4dAACAK4AePh0AAIArgB4+HQAAgCuAHj4dAACAK4AePh0AAIArgB4+HQAAgCuAHj4dAACAK4AePh0AAIArgB4+HQAAgCuAHj4dAACAK4AePh0AAIArgB4+HQAAgCuAHj4dAACAK4AePh0AAIArgB4+HQAAgCuAHj4dAACAK4AePh0AAIArgB4+HQAAgCuAHj4dAACAK4AePh0AAIArgB4+HQAAtBHgR8f336/dvP95y+CmZSWcqG3pG/xMvlJmf/6TBkAx8TfAUB3iAEjHYCrxI+sfz+HDuELQhoAo8RLq79jf7A6nG0AuKrs7j0CARA6ksX6X0t3B+C4x9WOqBQH0DZ8G1Nn8zoKvAKkV3WaAoC1SlYFoGOvUg6A8KT4O8zqGtrveI1f1QXSHEAr9OoArOICBEBL5sX41YDdwiAATgCc3Vju3jccP21eigCYpft/otQFOj1rtwVglTeAIwaam0sHEFoDsIeg4/1/ZB7SF8Lq20MpAB0qwPEEMC0lPTZMiwsmlQEgrRBBDMsPsT6TewReAkC17XkId7XGKzbLcVUFQToAmiZpE9kqamSiCYBSXetZt1KfMHusVbhAigPMBDYrqpLTqeEeR5u1UKwbDwdglHzJezkaAFcvipa+QgJFKQCSoAjAnzRKtJIk/DgmFADP6t82HiWERbyzOR7HQGbzWwaAJJGWG4NXIq3reAJg3YNmXhgAM43fvgKOwUjA0QjgPXY1aNMBkCYwuxv2AoEAfCk5a4UEwAvJ8TphDjC7fQIwq6Bs/lIASI8PWehxoyzuV/XcTQACONACUPnW0QKAM/pXa6aOHFkhyHa5NgAcX7u0AgYU8vSSmh+yNGOnN7ZboByAK/t7AgCaRFXFWwrAXdBVVaFJnNfYqiOvDICqgL0SFrHOXUFEfJMARKhqXLOiKEoAWPWRx5hX8TRoALKvP+KsJA6EAACh+q2vegQgsdoiP2W9vTweAITqf4FlBWA/dwM0+mhMbQLRADi+bkpdZwYg6Te2cakAWAjPFEMr3tX4yh93tDGkA6CxyJWE3Atf8aCjTXyZA2g2+hQArEeBRivrWHcHsF6BzgJ4EgBdIWgLwEo2eoR3pWaXAFi9czAvE4BZx3UFwKtjr3gQ8eQgEwBNU30WoxsAnud1toCeyT+76u7Xj3rYsRafCwDeFUsA9EhaC5AA6LUWzciG2FqE7QC4Eq7rNUryGriNibL/bX0LdNMAWD46KqGnAGB59hZZi+H2MSqeZQCIrp5Z8e+cQLt/y/VuVDxXEEwBEFGt3o4SldjodS1dPQGIzkri+tauXluUSziA1j4T8xT2qSUAGD16zCTNGnxYNgoWnv0tRHotnHKAvS5Mmi8l0gTeNZ93V1A3AHzD52qzAOzfBkZunAKApaNFR8ALgDsdCcCdQkX/fxwAM01hUQ5KP5v1HhLuAGwObRwRAJtuj5n1CABm77KPyaYxkIw+IPQIIADGzO+mRWsYBkAGvfPy9l8huociAP0ZCN0hAQiVt//iIQBkdbD95e2/QwLQP0ehO0wDgC+BoXk0Lx4CwGs30dcXc8Sc+I8CYQBQ5zUU+AQPS1SuWDvYLQAAAABJRU5ErkJggg=="},"1264":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAADZElEQVR4Xu2XQY6bUABDZy7Ufc/Vc/Rc3fdCrbJAihAQHpDkx36zHMV8bD9M8v3lX3UC39XuNf8lAOUQCIAAlCdQbt8FEIDyBMrtuwACUJ5AuX0XQADKEyi37wIIQHkC5fZdAAEoT6DcvgsgAOUJlNt3AQSgPIFy+y6AAJQnUG7fBRCA8gTK7bsAAlCeQLl9F0AAyhMot+8CCEB5AuX2XQABKE+g3L4LIADlCZTbdwEEoDyBcvsugACUJ1Bu3wUQgPIEyu27AAJQnkC5/eEW4NfPH/+mTn7/+Tvc/aXxMlzA9wDcwqYQnAHojPZTwRgOgFuQRyCYa14NjwBcnMAeCJZKP1L8/a3vOXfJ6qSji3VxbPhyQy7A0gpQZ2eKIGAdBYb6edbnhwfgVuRaIUtfFq96jz86c62QM+A9q+St6w4JwFqJ85ldmt13A3D2FfRqCIYDYKvAPQAc/RI5D37PWVsr8SlLMBQAj96ne0qZijyzBEvarbWZyj5z5quf/Om8YQGYP0FbpazN7tFv5nvKvl+a+3s9eqYAPEjgme/7tZ+Bj4r9xCd+HvNQC7DFwNqTdfUTR84RgBfu1tVF01snYNBrv/PzH7MA7wxp7X2/9f933+/e8wVgZ1LvXqCdt4k/JgA4siyBAGT1id0IAI4sSyAAWX1iNwKAI8sSCEBWn9iNAODIsgQCkNUndiMAOLIsgQBk9YndCACOLEsgAFl9YjcCgCPLEghAVp/YjQDgyLIEApDVJ3YjADiyLIEAZPWJ3QgAjixLIABZfWI3AoAjyxIIQFaf2I0A4MiyBAKQ1Sd2IwA4siyBAGT1id0IAI4sSyAAWX1iNwKAI8sSCEBWn9iNAODIsgQCkNUndiMAOLIsgQBk9YndCACOLEsgAFl9YjcCgCPLEghAVp/YjQDgyLIEApDVJ3YjADiyLIEAZPWJ3QgAjixLIABZfWI3AoAjyxIIQFaf2I0A4MiyBAKQ1Sd2IwA4siyBAGT1id0IAI4sSyAAWX1iNwKAI8sSCEBWn9iNAODIsgQCkNUndiMAOLIsgQBk9YndCACOLEsgAFl9YjcCgCPLEghAVp/YjQDgyLIEApDVJ3YjADiyLIEAZPWJ3QgAjixLIABZfWI3AoAjyxIIQFaf2I0A4MiyBAKQ1Sd28x8lgfiBb4xt2wAAAABJRU5ErkJggg=="},"1265":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACNklEQVR4Xu3Z0WkCYRQF4bW2FGNNKSa1RYSERFHx6svyz5dnBefc2VHIYfOXXuCQpge/ESAuAQEIEF8gjq8ABIgvEMdXAALEF4jjKwAB4gvE8RWAAPEF4vgKQID4AnF8BSBAfIE4vgIQIL5AHF8BCBBfII6vAASILxDHVwACxBeI4ysAAeILxPEVgADxBeL4CkCA+AJxfAUgQHyBOL4CECC+QBxfAQgQXyCOrwAEiC8Qx1cAAsQXiOMrAAHiC8TxFYAA8QXi+ApAgPgCcXwFIEB8gTi+AhAgvkAcf+kCfGzH71v3/do+l+aeOL3sEPeOT4jLBZYSYHL0R09JqRAEuGECASZfIjt6rQLMj6EACjC3Zq/vUID5ZRRAAebW7Pkd71ag9APwfMelCvAr5jsSEGDPj/fgs70iQe34yxbg2RIUD379DC35FfAf0v8DHmczKYAn/0+K5QUY/GxIvpQAybMrQPzsBCDAzwK+AuIqEIAA8QXi+ApAgPgCcXwFIEB8gTi+AhAgvkAcXwEIEF8gjq8ABIgvEMdXAALEF4jjKwAB4gvE8RWAAPEF4vgKQID4AnF8BSBAfIE4vgIQIL5AHF8BCBBfII6vAASILxDHVwACxBeI4ysAAeILxPEVgADxBeL4CkCA+AJxfAUgQHyBOL4CECC+QBxfAQgQXyCOrwAEiC8Qx1cAAsQXiOMrAAHiC8TxFYAA8QXi+ApAgPgCcXwFIEB8gTi+AhAgvkAcXwEIEF8gjn8Cc3cqge9fQBUAAAAASUVORK5CYII="},"1266":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAB60lEQVR4Xu3YQREAIBDDwMM5YvAJM9jI4uBIHm3X3eeOl/2BRYAs+384Adr8CRDnTwACCIFpB2SANH4hMI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+AlAADtA2wEZoM1fDYzzJwAB7ABpB2SANH41MI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+AlAADtA2wEZoM1fDYzzJwAB7ABpB2SANH41MI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+AlAADtA2wEZoM1fDYzzJwAB7ABpB2SANH41MI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+AlAADtA2wEZoM1fDYzzJwAB7ABpB2SANH41MI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+AlAADtA2wEZoM1fDYzzJwAB7ABpB2SANH41MI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+AlAADtA2wEZoM1fDYzzJwAB7ABpB2SANH41MI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+AlAADtA2wEZoM1fDYzzJwAB7ABpB2SANH41MI6fAASwA7QdkAHa/NXAOH8CEMAOkHZABkjjVwPj+GcelvGRkDAY0SwAAAAASUVORK5CYII="},"1269":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAB0UlEQVR4Xu3UAQ0AAAyDsM+/6QspcwAh2zXawGj64K8A8AgKoABwAzh+D1AAuAEcvwcoANwAjt8DFABuAMfvAQoAN4Dj9wAFgBvA8XuAAsAN4Pg9QAHgBnD8HqAAcAM4fg9QALgBHL8HKADcAI7fAxQAbgDH7wEKADeA4/cABYAbwPF7gALADeD4PUAB4AZw/B6gAHADOH4PUAC4ARy/BygA3ACO3wMUAG4Ax+8BCgA3gOP3AAWAG8Dxe4ACwA3g+D1AAeAGcPweoABwAzh+D1AAuAEcvwcoANwAjt8DFABuAMfvAQoAN4Dj9wAFgBvA8XuAAsAN4Pg9QAHgBnD8HqAAcAM4fg9QALgBHL8HKADcAI7fAxQAbgDH7wEKADeA4/cABYAbwPF7gALADeD4PUAB4AZw/B6gAHADOH4PUAC4ARy/BygA3ACO3wMUAG4Ax+8BCgA3gOP3AAWAG8Dxe4ACwA3g+D1AAeAGcPweoABwAzh+D1AAuAEcvwcoANwAjt8DFABuAMfvAQoAN4Dj9wAFgBvA8XuAAsAN4Pg9QAHgBnD8HqAAcAM4fg9QALgBHL8HKADcAI7fAxQAbgDH7wEKADeA4/cABYAbwPF7ADyAB6SPAIFm19U7AAAAAElFTkSuQmCC"},"1270":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACVElEQVR4Xu3d0ZXiMBQEUZwBkZAdUZAdkZABHBt8sKwQ6s7n/nVTlKQnzc5y8ZNuYEmnF/4CgDgEAABAvIF4fAYAQLyBeHwGAEC8gXh8BgBAvIF4fAYAQLyBeHwGAEC8gXh8BgBAvIF4fAYAQLyBeHwGAEC8gXh8BgBAvIF4fAYAQLyBeHwGAEC8gXh8BgBAvIF4fAYAQLyBeHwGAEC8gXh8BgBAvIF4fAYAQLyBeHwGAEC8gXh8BgBAvIF4fAYAQLyBeHwGAEC8gXh8BgBAvIF4fAYAQLyBeHwGAEC8gXh8BgBAvIF4fAYAQLyBeHwGAEC8gXh8BgBAvIF4fAYAQLyBeHwGAEC8gXj8pAGuz/v7dXsks595z5Xgwx8RAIAloNUAAzCA9f/AgCWgJcApbRKAtQWngC8LOQDW0PYBfxFkAWCBsAFYIG4AAADAPuDHQHIPwAAMwAAM4EYwPQdwDAwfAw2CwnuA9cP37Y8D4B4AANnjrydh3gMODKS+CTZ/8+OHFAAmgADYJoBOAeFN4G4BEIQHQZaCuAEAAAC3gW4D3QZmbwMtAfElwFEQAH49rLoH8O0fp4FGwfN0NPUvAEh93O4CnP9PDDAAA7Qa8CbAJtAR8MCAJaAlwCltEgBvAUwCLQPVSaCLoPgmEAAA2BpwHPQm0D6g+t/EMUD8FAAAANgDlI+BDMAADFA2gGdhcQOYAYQB8O2PTwJ9+wFgAuhBiL8ZuDOQexBiBhBfAnYAvApyG2gvUL8NZIHoXw3bV0FHQgDkl4HkKcBJIDwKpv/xGPgBuD4EkGRMTUkAAAAASUVORK5CYII="},"1271":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC6klEQVR4Xu2WMU7EUBQDsw0H4aKIi3IQGlCKSFG0yadAXufPUAEr4Wd7YvJY/EIn8EC71/wiAHAIBEAA4AnA7bsAAgBPAG7fBRAAeAJw+y6AAMATgNt3AQQAngDcvgsgAPAE4PZdAAGAJwC37wIIADwBuH0XQADgCcDtuwACAE8Abt8FEAB4AnD7LoAAwBOA23cBBACeANy+CyAA8ATg9l0AAYAnALfvAggAPAG4fRdAAOAJwO27AAIATwBu3wUQAHgCcPsugADAE4DbdwEEAJ4A3L4LIADwBOD2XQABgCcAt+8CCAA8Abh9F0AA4AnA7bsAAgBPAG7fBRAAeAJw+y6AAMATgNt3AQQAngDcvgsgAPAE4PZdAAGAJwC37wIIADwBuH0XQADgCSzL8vH2/vP5/YV8GJCm98iv5W8/HyHYPpsZjikBuCr1WP5W7rHsbRVmh2A6APaFXU37s8/2vzv7fgVoJiimAmBU6vb0nxV49tQfodqvyP7fw1+Xp+mt65YAPCvwqtQ18LWo0ZM7eh/Y/sbo30ZTwaNbbgXAvqCjsasXtf94MkeAbZCNAm/7/HYAzPxG/go4bgPAaL5fEd4MmrcBYIawGz0IQGMrwZsEIBh2o5QANLYSvEkAgmE3SglAYyvBmwQgGHajlAA0thK8SQCCYTdKCUBjK8GbBCAYdqOUADS2ErxJAIJhN0oJQGMrwZsEIBh2o5QANLYSvEkAgmE3SglAYyvBmwQgGHajlAA0thK8SQCCYTdKCUBjK8GbBCAYdqOUADS2ErxJAIJhN0oJQGMrwZsEIBh2o5QANLYSvEkAgmE3SglAYyvBmwQgGHajlAA0thK8SQCCYTdKCUBjK8GbBCAYdqOUADS2ErxJAIJhN0oJQGMrwZsEIBh2o5QANLYSvEkAgmE3SglAYyvBmwQgGHajlAA0thK8SQCCYTdKCUBjK8GbBCAYdqOUADS2ErxJAIJhN0oJQGMrwZsEIBh2o9Qv3F+YgeiNqtkAAAAASUVORK5CYII="},"1272":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAFFUlEQVR4Xu2da47bMAyEN/fsYfYwvecWCWrAdW2JpPgUpz8bvTj8NKKUFH194U9rBV6to0fwXwCgOQQAAAA0V6B5+HAAANBcgebhwwEAQHMFmocPBwAAzRVoHj4cAAA0V6B5+HAAANBcgebhwwEAQHMFmocPBwAAzRVoHj4cAAA0V6B5+HAAANBcgebhwwEAQHMFmocPBwAAzRVoHj4cAAA0V6B5+HAAANBcgebhwwEAQHMFmocPBwAAzRVoHj4cAAA0V6B5+HAAANBcgebhwwEAQHMFmocPBwAAzRVoHj4cAAA0V6B5+OUc4Of798+Rs9f3r3Lrz8ZbCQHPST8L6AXAe/7zXMd6vOa3hCYdAHc7PBKAp7kjQLQAITUAs4CtdyAl+dc1Wq9ppgn389IAWNcCEgDea6oEwRYAWIguTb7FWri7mtN+GwAshJdCAAfgIHjTNpPwkrUAgEUA3t2zCM9dR6Xkf1xTIVcmQ1yFP4QdJURb/N2TnxqAEVV3idFOPtWFLOY12VEPg6Z1ACoAlgmYOYDl3F4QlATASxwA4KV04nm4x81T7ZI1xHQOUPmLFi4sGaBIBUC13XNNIABYRLqigOeQK67fxQGoOzuzgNQfolDbLe4Vte7mAHCSymmrpgBhoKzrIix92sQUAO6rXVahn+LAO8CEL8k9mnpcTNFWasCFWGlat2FCHKDSztl595t/F7CDeDvEMLITUwe4+0JlZfdHVdjZjiXN88EcgDMEWsk/BFgZT1PEymO5AKAh0O5WrKGRZAwAIFFtoz4AYKNkSkIBABLV/vaRFqXvflnqlzAAJOJlqcalL5ZZ1n9mPgQAqYBaN4qFTf/pyi1IZy+inweZoH/pnAaASBG4QFgAEBU/AOBmn+kAlN0f+a4BAJQAeLJwDgARLgAAAIBAAXT5FILUwo3qAtTxNOUPcQDNACqM9XTryXAtTAnAyjUxKxBHTNdd/vT3XnGkA2D3X+B4JZY6DwCgKrVpOwCwaWKpYaUDQPLUSg0W7f5XoAwAEVekETDRxZsWzCkBuLpA1uSfk5BtjVRA0gJADSCi3U7XVADAJIj7TSBzePfmrgBkePlaVVgTgHMdwXlaXo3hn6NLc7DZWDtYpwUAkbWEmwNoCjcDzfJzTYg1x5LG7ALATs+7kt8y3iUniyahAFS9Ommc1+0BqJp8qdVyXMBTGxcHyP6wo5lU7ljRNyM3ALjCVG3PPR6in5QBgBJpVW85aQHQqraV8jsdBgBMJaI3yHA/pq92/H8beBZ0nDUfbVM6QLXdlOVKtwUAFcWsuOY0DjAS70p0ZjutCkHoEcBJ/huGzABc3zqqwAsAJAfnoE+1+kUNAMm1jWKb0Q8lXD4oMXHHtGyvAoD02lZNLEoiqsW0BIBGsNUscwbBSjzSjTRb0+jzcADuiqfsxd5IUG0ArIvfFADs9G3hyi5egUfqAiYAVN7BUiE1+pUDYDf71kjiyhglATgCrnZdW0mUZd+VI+S8Id8uTPltwtIRIBFC8l4gmadqn1UX4ALkCsB1cagV7jHlJnH2DD26SbgBIAmq6i5eXbfEBWbfqzxtNgCwmi2D/gDAQNToISkF2bWgvq55dGTCAaIzPJhfUvhy6yU3AFauexIhEueVtDSv2scFAK9gSMoWaCRNijQ0Se1ALgJHweA6R7/OnVtm0A0ASLcbod/MAUb3c8LwKk1UAMgQiIoayoMAAGVBqw0HAKplzGC9Mwii64A/N4kkrum76qoAAAAASUVORK5CYII="},"1273":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAADC0lEQVR4Xu2YzU4bARgDyXv10ifvpe8FyiHSCkFFxCzVrIdzcPzZE+fn9tLfdAK36es7/iUAxiEIgAAYT2D8/BYgAMYTGD+/BQiA8QTGz28BAmA8gfHzW4AAGE9g/PwWIADGExg/vwUIgPEExs9vAQJgPIHx81uAABhPYPz8FiAAxhMYP78FCIDxBMbPbwECYDyB8fNbgAAYT2D8/BYgAMYTGD+/BQiA8QTGz28BAmA8gfHzW4AAGE9g/PwWIADGExg/vwUIgPEExs9vAQLAl8Cf11+vD9e/b3+D+BsVqsI7Fn+8+ScguCp0lwDgDsNZEPxP6L7xwv7yvyoBeJT9vhwags/KPxO4LzcHPVANwD2DM6f5I+0znw/q9CkZPQBHCM5agKPu2avzVHvAgwPgHyE+yn4P1pVWQAnA8T34zDI+0z7zOYEX9VMSWgA+uvKst4Djbw5XKv9+lwqA9x/6fuK3gKt/E9AB8NS+gQ++2oe/RzQBAEJilAoAY2ug5wAAwzRKBYCxNdBzAIBhGqUCwNga6DkAwDCNUgFgbA30HABgmEapADC2BnoOADBMo1QAGFsDPQcAGKZRKgCMrYGeAwAM0ygVAMbWQM8BAIZplAoAY2ug5wAAwzRKBYCxNdBzAIBhGqUCwNga6DkAwDCNUgFgbA30HABgmEapADC2BnoOADBMo1QAGFsDPQcAGKZRKgCMrYGeAwAM0ygVAMbWQM8BAIZplAoAY2ug5wAAwzRKBYCxNdBzAIBhGqUCwNga6DkAwDCNUgFgbA30HABgmEapADC2BnoOADBMo1QAGFsDPQcAGKZRKgCMrYGeAwAM0ygVAMbWQM8BAIZplAoAY2ug5wAAwzRKBYCxNdBzAIBhGqUCwNga6DkAwDCNUgFgbA30HABgmEapADC2BnoOADBMo1QAGFsDPQcAGKZRKgCMrYGeAwAM0ygVAMbWQM8BAIZplAoAY2ug5wAAwzRKBYCxNdBzAIBhGqUCwNga6DkAwDCNUgFgbA30HABgmEapADC2BnoOADBMo9QbHN54gZmuQd8AAAAASUVORK5CYII="},"1274":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACtUlEQVR4Xu2YQU7DABDE2t/wJV7Il/gNVZAicYho5KPHPSLm4BlnQ3k++kw38JymD/6RAOMSJEACjDcwjt8FSIDxBsbxuwAJMN7AOH4XIAHGGxjH7wIkwHgD4/hdgAQYb2AcvwuQAOMNjON3ARJgvIFx/C5AAow3MI7fBUiA8QbG8bsACTDewDh+FyABxhsYx+8CJMB4A+P4XYAEGG9gHL8LkADjDYzjdwESYLyBcfwuQAKMNzCO3wVIgPEGxvG7AAkw3sA4fhcgAcYbGMfvAiTAeAPj+F2ABBhvYBy/C5AA4w2M43cBEmCggY/Pn8f3V7JfTO0v5Rj/+LwTYFSSDQHejX8IkgDSV8HdYe/+nqymLsD59N95TcjGP3ASYPj8J8D5RI+e/x0B/jvvd78lCM//hgDvTvzw078lwNUVGH/6dwS4+ku/8X9fav5vAX/f3efo58/u/INI+u4/sbYEkI9J8BKAtCbKJIBoTIKSAKQ1USYBRGMSlAQgrYkyCSAak6AkAGlNlEkA0ZgEJQFIa6JMAojGJCgJQFoTZRJANCZBSQDSmiiTAKIxCUoCkNZEmQQQjUlQEoC0JsokgGhMgpIApDVRJgFEYxKUBCCtiTIJIBqToCQAaU2USQDRmAQlAUhrokwCiMYkKAlAWhNlEkA0JkFJANKaKJMAojEJSgKQ1kSZBBCNSVASgLQmyiSAaEyCkgCkNVEmAURjEpQEIK2JMgkgGpOgJABpTZRJANGYBCUBSGuiTAKIxiQoCUBaE2USQDQmQUkA0pookwCiMQlKApDWRJkEEI1JUBKAtCbKJIBoTIKSAKQ1USYBRGMSlAQgrYkyCSAak6AkAGlNlEkA0ZgEJQFIa6JMAojGJCgJQFoTZRJANCZBSQDSmiiTAKIxCUoCkNZEmQQQjUlQEoC0Jsq8AM/IQoFrfumvAAAAAElFTkSuQmCC"},"1275":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAB70lEQVR4Xu3YsRHAMAzDQGkD9ymz/4zxXdbAewMZKEjuc95vvOwPLAGy7P/DCdDmT4A4fwIQQAhMOyADpPELgXH8BCCAHaDtgAzQ5q8GxvkTgAB2gLQDMkAavxoYx08AAtgB2g7IAG3+amCcPwEIYAdIOyADpPGrgXH8BCCAHaDtgAzQ5q8GxvkTgAB2gLQDMkAavxoYx08AAtgB2g7IAG3+amCcPwEIYAdIOyADpPGrgXH8BCCAHaDtgAzQ5q8GxvkTgAB2gLQDMkAavxoYx08AAtgB2g7IAG3+amCcPwEIYAdIOyADpPGrgXH8BCCAHaDtgAzQ5q8GxvkTgAB2gLQDMkAavxoYx08AAtgB2g7IAG3+amCcPwEIYAdIOyADpPGrgXH8BCCAHaDtgAzQ5q8GxvkTgAB2gLQDMkAavxoYx08AAtgB2g7IAG3+amCcPwEIYAdIOyADpPGrgXH8BCCAHaDtgAzQ5q8GxvkTgAB2gLQDMkAavxoYx08AAtgB2g7IAG3+amCcPwEIYAdIOyADpPGrgXH8BCCAHaDtgAzQ5q8GxvkTgAB2gLQDMkAavxoYx08AAtgB2g7IAG3+amCcPwEIYAdIOyADpPGrgXH8BCCAHaDtgAzQ5q8GxvkTgAB2gLQDMkAavxoYxz9zAbTspwHVC9bHAAAAAElFTkSuQmCC"},"1280":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAF10lEQVR4Xu2dQY7WMAyFZ47AghuwgVNxEA7DqUBC3IAFRwBVo0idqk2eEzu2kzcbFqRu4vf5Oek//ef1hT9bZ+B169Vz8S8EYHMICAAB2DwDmy+fDkAANs/AzfJ/fPrwT5KVL7//pi2ktBOXCNQaKxW8Fi8bDNsCoCn6ExAZYNgKgBmiX2GIDsEWAHgInwWEpQGIIHx0EJYFIKL4BYZIbYEAtI4IRv8fBYLlAIhc+RHbwVIAZBI/SjtYBoCM4keAYAkAMovvDUF6AFYQ3xOC1ACsJL4XBATA6JjXG3b28TAtACtW/wENAQBKZ1XxPdpAOgdYXfzZLkAAAMfxGDKrFaQCYIfqn90GCIBHeYP31HCBUjRPsdIAsFP197oAkqMrCAQArEaPYU9ViwiN/p5iCgBGFuwhnNY9rwCM5uEOKAKgpVaCOAQggUhWU0y7CRy1PauEZopbO02EbwEEYAy11lESBqAmROsmvUug+L2Ze7sO0aUKgKYAyGSuy9W8/1gqc10tyXXTAWaIYHHezSWZ3mwl4h93bQJwDJoBwTkFZRGz76sng08kqfhhAfBJX+679ogPA+DhArnlmD97cwAIwXxR0Tv2ii9ygPNk2JtRaWzHjQhfZgZtAp+WQRBsBX6KriG8CgAlCEGYB4Km+N0tgI4wT/C747Hm3YdaQG0idAVNmd5iaVe/ugPcLZkgjIHw+evHl5/f/+QF4Lp8AoEBcQh//BTxy1XaLmDWArBlzn/MjM7Lc9yT+BZtwB0AniTeo1YTf2kAzmnYsU0U4e9s3/IkEMYBdt1Atir+mpfl9gA7HyXPO3x0z7EVAEdSVm0HPeJvswfYYT9AAEDPowO8TxRbAAhO5GG91c8WEFlVwdwIgCBZq7UA6bFv62PgiqeAkerfsgWsBMFo9RMAQeuIOHS0+glARFUFcxoFQPsIeEw99GcBq31SSAAE1bLD00BpOugA0owtNn5bALKfBA7hRp9nWIifZg+wAgCjayAAwr/oHcn9NV533x6A0QryBOIsXm8rIACJfzlkFAAr8VPtAbI6wJ14UhcgACf/libP0/qfHt1K10AACIDZE1uzwFaVJ60eq3mgcUdbgGX1p9sDZNsHaHz9HQG4KbUsLkAAUJ8UjssAQK1y0flbV3/KFpClDRAAYVVLh6NVJI2rMb5VuejcW3E05pruFFAWjSZRI0nSGC3h0Lm34kjndTeeAGhk8RQDEQ0BAImjMXUCoJFFAqCcRTAcUklgKJVhaNW25o3G0Zh0WgeIeBpAhIskftpjYMSNICI+Ai0aR6P6CYBWFgVf4lhzgNnipwcAqShFjW9Dlde9Xr/9arbTaPZPABToKC97INUbrfoJAAHI8WpYTaeWrSpo/BhC8j2+Eat/CQfw2gfcvefX+wEQ0j6sQG5uXKxurBnXwwUkAEStfjpAJ4VPb/lKf/3Ls/LL0ukAHRBoABBB/GUcYOY+oPaO/1XUJ+uPIj4BEFZ/6wseEAAiiU8ABAAgX/BUAyCa8EvtAWa0gFb1H3OIKnKNc24CARdAxC9hskGQHoAZzwAIAFAls4fcCS8RSjJfadxMLpDSAZ6qXioUAkFvzCwQpAAAtflesWogjMaMDkJ4AFDxDxFHxbqCoBUvMgShAZCIHxmAyCeEcABIRT9XrVbFWsAUFYJQAIyIX0Q7/r3+vV1ks2cFUu3eEVpDGABGxS+JHnWB0eulsHk/QQwBgJb4o9btIb53a3AFQFP4UQfwFP/sGrPbghsAFuL3OkAU8T1AcAHASnwpAMhHvD09XfMaa0eYCoCl8NJdfAbxZzjClgBkE98ShCkAzKr880bw7nlAZuGvbUWrNZgDMFv8KwTXxI0+JNLs76OxNCBYFoDR5Ga4ngBkUMl4jqMQmDmAl/Ub5zts+F4QTACg+D6c9EBAAHy0MrlrCABY/SbawkGlEKg6AMWHdTIdKIGAAJhK4RPcBQBWv4/YT3dFIVBxAIofS/xjNtMAoPjxxJcA8B/nTUKuwG5fnQAAAABJRU5ErkJggg=="}}}</script>
+    
+  
+</body></html>
