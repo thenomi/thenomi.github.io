@@ -24,12 +24,12 @@ font-family: 'EB Garamond', serif;
 a:hover {
   color: #01194f;
   }
-    ul{
+  /*  ul{
     list-style-type: none;
     padding: 5px;
     margin: 5px;
     line-height:1.6em;
-    }
+    } */
 ::selection {
   background: #000; /* WebKit/Blink Browsers */
   color:#fff;
