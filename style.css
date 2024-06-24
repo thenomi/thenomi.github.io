@@ -1,4 +1,13 @@
 @import 'https://fonts.googleapis.com/css?family=EB+Garamond';
+// <uniquifier>: Use a unique and descriptive class name
+// <weight>: Use a value from 400 to 800
+
+.eb-garamond-<uniquifier> {
+  font-family: "EB Garamond", serif;
+  font-optical-sizing: auto;
+  font-weight: <weight>;
+  font-style: normal;
+}
 body {
   background-color: #fff;
   line-height: 1.6;
