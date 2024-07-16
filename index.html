@@ -13,6 +13,94 @@
 <link rel="mask-icon" href="favicon_package_v0.16/safari-pinned-tab.svg" color="#0b05bb">
 <meta name="msapplication-TileColor" content="#0b05bb">
 <meta name="theme-color" content="#ffffff">
+    <style>
+      .showcase {
+max-width: 600px;
+aspect-ratio: 16/4.8;
+display: flex;
+position: relative;
+margin: 2rem 0;
+}
+
+@keyframes showImage {
+  0% { opacity: 0; }
+  1% { opacity: 1; }
+  10% { opacity: 1; }
+  11% { opacity: 0; }
+  100% { opacity: 0; }
+}
+
+@keyframes throw-r {
+	from {
+		transform: translate3d(0px,0,0);
+		opacity: 1;
+	}
+	to {
+		transform: rotateZ(2deg) translate3d(90px,50px,0);
+		opacity: 0;
+	}
+}
+
+.showcase img {
+  --num-images: 12.2;
+  --show-dur: 3s;
+  height: 100%;
+  width: 100%;
+  display: block;
+  object-fit: cover;
+  border-radius: 27px;
+  position: absolute;
+  animation: showImage calc(var(--num-images) * var(--show-dur)) cubic-bezier(0.190, 1.000, 0.220, 1.000) both infinite;
+}
+
+.showcase img:nth-child(1) {
+	animation-delay: calc(var(--show-dur) * (1 - 1));
+}
+
+.showcase img:nth-child(2) {
+	animation-delay: calc(var(--show-dur) * (2 - 1));
+}
+
+.showcase img:nth-child(3) {
+	animation-delay: calc(var(--show-dur) * (3 - 1));
+}
+
+.showcase img:nth-child(4) {
+	animation-delay: calc(var(--show-dur) * (4 - 1));
+}
+
+.showcase img:nth-child(5) {
+	animation-delay: calc(var(--show-dur) * (5 - 1));
+}
+
+.showcase img:nth-child(6) {
+	animation-delay: calc(var(--show-dur) * (6 - 1));
+}
+
+.showcase img:nth-child(7) {
+	animation-delay: calc(var(--show-dur) * (7 - 1));
+}
+
+.showcase img:nth-child(8) {
+	animation-delay: calc(var(--show-dur) * (8 - 1));
+}
+
+.showcase img:nth-child(9) {
+	animation-delay: calc(var(--show-dur) * (9 - 1));
+}
+
+.showcase img:nth-child(10) {
+	animation-delay: calc(var(--show-dur) * (10 - 1));
+}
+
+.showcase img:nth-child(11) {
+	animation-delay: calc(var(--show-dur) * (11 - 1));
+}
+
+.showcase img:nth-child(12) {
+	animation-delay: calc(var(--show-dur) * (12 - 1));
+}
+    </style>
   </head>
   <body>
   <div class="content">
@@ -22,6 +110,21 @@
       <strong>Nomi</strong> does <strong>2D/3D visuals</strong> and is updating this website. | 27 June 2024</p>
 <hr size=1 color=#000 width="50" align="left">
  <p><a href="#hi">Hi</a> / <a href="#games">Games</a> / <a href="#vids">Videos</a> / <a href="#illos">Illustrations</a> / <a href="#theatres">Interactive & Theatre</a> / <a href="#misc">Misc.</a> / <a href="#exhibits">Exhibitions</a> / <a href="#press">In Media</a> / <a href="#talks">Public Speaking</a> / <a href="#awards">Accolades</a> / <a href="#socials">Socials</a></p>
+<hr size=1 color=#000 width="50" align="left">
+     <div class="showcase">
+	 <img src="./TheNomi.com_files/Ihv8t44.png">
+	 <img src="./TheNomi.com_files/AspaBAz.png">
+	 <img src="./TheNomi.com_files/bZU9kv1.jpg">
+	 <img src="./TheNomi.com_files/XIl1Euw.png">
+	 <img src="./TheNomi.com_files/VKNkK71.png">
+	 <img src="./TheNomi.com_files/jDGgbqI.jpeg">
+	 <img src="./TheNomi.com_files/fDbg6NY.png">
+	 <img src="./TheNomi.com_files/qH9j7Bg.png">
+	 <img src="./TheNomi.com_files/H7re2Xc.png">
+	 <img src="./TheNomi.com_files/gguBTGF.png">
+	 <img src="./TheNomi.com_files/5BTBdmk.jpg">
+	 <img src="./TheNomi.com_files/E5qLr1p.png">
+ </div>
 <hr size=1 color=#000 width="50" align="left">
 <ul>
 <!-- default -->
@@ -141,6 +244,10 @@ Viewfinder:
     Cheers,
     <br />
     N.
+    </p>
+<br /><br />
+    <p>
+      Image slide show by <a href="https://emu.media/">emu</a>. tysm!!!!
     </p>
     </div>
   </body>
