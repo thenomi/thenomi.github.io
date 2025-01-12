@@ -16,6 +16,9 @@ body {
 a {
   color:#039cfd;
 }
+.icon {
+	font-decoration:none;
+}
 .em {
 font-style:italic;
 font-weight:bold;
